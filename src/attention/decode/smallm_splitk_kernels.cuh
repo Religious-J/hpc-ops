@@ -200,30 +200,31 @@ __device__ __forceinline__ void load_paged_kv(TmaK &tma_k, TmaV &tma_v, uint64_t
 // - Y store: Swizzle period 16 BF16; d aligned to 8 => uint4 safe; float->BF16 in registers.
 // - splitY store: Swizzle period 8 floats; d aligned to 4 => float4 safe.
 
-// Preconditions: entire load warp invokes together. Linear q_base covers
-// heads_per_group * num_dim_qk Tin elements; leader signals q_readable after __syncwarp.
+// Preconditions: all num_threads threads invoke together. Linear q_base covers
+// heads_per_group * num_dim_qk Tin elements; caller is responsible for syncing and
+// signalling q_readable after this call returns.
 template <typename Tin, typename TensorQG, typename TensorSQ>
 __device__ __forceinline__ void load_q_group_direct_to_smem(
     TensorQG const &Q, TensorSQ &sQ, int ihead_q0, int ibatch,
-    int heads_per_group, int num_dim_qk, int rank_in_load_warp) {
+    int heads_per_group, int num_dim_qk, int rank_in_threads, int num_threads) {
   using namespace cute;  // NOLINT
 
   const int total_elems = heads_per_group * num_dim_qk;
-  constexpr int kVecSize   = 8;  // uint4 = 128 bits = 8 BF16 elements
-  constexpr int kVecStride = 32 * kVecSize;
+  constexpr int kVecSize = 8;  // uint4 = 128 bits = 8 BF16 elements
+  const int kVecStride   = num_threads * kVecSize;
 
   const Tin *q_base = Q(ihead_q0, _, ibatch).data().get();
-  for (int base = rank_in_load_warp * kVecSize; base + kVecSize <= total_elems;
+  for (int base = rank_in_threads * kVecSize; base + kVecSize <= total_elems;
        base += kVecStride) {
     int lh = base / num_dim_qk;
     int k  = base % num_dim_qk;
     store(&sQ(lh, k), load<Tin, kVecSize>(q_base + base));
   }
   const int vec_covered = (total_elems / kVecStride) * kVecStride;
-  for (int elem = vec_covered + rank_in_load_warp; elem < total_elems; elem += 32) {
+  for (int elem = vec_covered + rank_in_threads; elem < total_elems; elem += num_threads) {
     int lh = elem / num_dim_qk;
     int k  = elem % num_dim_qk;
-    sQ(lh, k) = Q(ihead_q0 + lh, k, ibatch);  
+    sQ(lh, k) = Q(ihead_q0 + lh, k, ibatch);
   }
 }
 
@@ -453,23 +454,10 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
     if (heads_per_group == kTileN) {
       // TMA path: all heads_per_group heads fit exactly in one TMA tile (kTileN heads).
       if (is_leader_in_load) {
-        // need check !!!!!!!!!!
-        auto *q_bytes = reinterpret_cast<unsigned char *>(shm_q);
-        for (size_t z = 0; z < cosize(SLayoutQ{}) * sizeof(Tin); ++z) {
-          q_bytes[z] = 0;
-        }
         // Load Q: ihead_kv is the tile index, valid when hpg == kTileN
         cute::copy(tma_q.with(q_readable), tQg(_, ihead_kv, _, ibatch), tQs(_, 0, _));
         set_barrier_transaction_bytes(
             q_readable, sizeof(Tin) * max(heads_per_group, size<0, 0, 1>(tQg)) * num_dim_qk);
-      }
-    } else {
-      const int rank_in_load_warp = idx - kMathThreads;  // 0..31
-      load_q_group_direct_to_smem<Tin>(Q, sQ, ihead_q0, ibatch, heads_per_group, num_dim_qk,
-                                  rank_in_load_warp);
-      __syncwarp();
-      if (is_leader_in_load) {
-        arrive_barrier(q_readable);
       }
     }
   }
@@ -569,7 +557,14 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
 
     tiled_mma_sv.accumulate_ = GMMA::ScaleOut::One;
 
-    wait_barrier(q_readable, 0);
+    // heads_per_group != kTileN: math warpgroup loads Q using kMathThreads threads.
+    if (heads_per_group != kTileN) {
+      load_q_group_direct_to_smem<Tin>(Q, sQ, ihead_q0, ibatch, heads_per_group, num_dim_qk,
+                                       idx, kMathThreads);
+      syncwarpgroup(iwarpgroup);
+    } else {
+      wait_barrier(q_readable, 0);
+    }
 
     int phase = 0;
     int istage_read = 0;

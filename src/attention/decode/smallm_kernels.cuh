@@ -203,22 +203,22 @@ __device__ __forceinline__ void load_paged_kv(TmaK &tma_k, TmaV &tma_v, uint64_t
 template <typename Tin, typename TensorQG, typename TensorSQ>
 __device__ __forceinline__ void load_q_group_direct_to_smem(
     TensorQG const &Q, TensorSQ &sQ, int ihead_q0, int ibatch,
-    int heads_per_group, int num_dim_qk, int rank_in_load_warp) {
+    int heads_per_group, int num_dim_qk, int rank_in_threads, int num_threads) {
   using namespace cute;  // NOLINT
 
   const int total_elems = heads_per_group * num_dim_qk;
-  constexpr int kVecSize   = 8;  // uint4 = 128 bits = 8 BF16 elements
-  constexpr int kVecStride = 32 * kVecSize;
+  constexpr int kVecSize = 8;  // uint4 = 128 bits = 8 BF16 elements
+  const int kVecStride   = num_threads * kVecSize;
 
   const Tin *q_base = Q(ihead_q0, _, ibatch).data().get();
-  for (int base = rank_in_load_warp * kVecSize; base + kVecSize <= total_elems;
+  for (int base = rank_in_threads * kVecSize; base + kVecSize <= total_elems;
        base += kVecStride) {
     int lh = base / num_dim_qk;
     int k  = base % num_dim_qk;
     store(&sQ(lh, k), load<Tin, kVecSize>(q_base + base));
   }
   const int vec_covered = (total_elems / kVecStride) * kVecStride;
-  for (int elem = vec_covered + rank_in_load_warp; elem < total_elems; elem += 32) {
+  for (int elem = vec_covered + rank_in_threads; elem < total_elems; elem += num_threads) {
     int lh = elem / num_dim_qk;
     int k  = elem % num_dim_qk;
     sQ(lh, k) = Q(ihead_q0 + lh, k, ibatch);
@@ -394,14 +394,6 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_kernel(
         set_barrier_transaction_bytes(
             q_readable, sizeof(Tin) * max(heads_per_group, size<0, 0, 1>(tQg)) * num_dim_qk);
       }
-    } else {
-      const int rank_in_load_warp = idx - kMathThreads;  // 0..31
-      load_q_group_direct_to_smem<Tin>(Q, sQ, ihead_q0, ibatch, heads_per_group, num_dim_qk,
-                                       rank_in_load_warp);
-      __syncwarp();
-      if (is_leader_in_load) {
-        arrive_barrier(q_readable);
-      }
     }
   }
 
@@ -412,9 +404,6 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_kernel(
   __syncthreads();
 
   if (idx >= kMathThreads) {
-  // 多出来的 1 个 warp
-  // 发 TMA、搬数据 和数学 warp 分工
-  // 这段线程专门做 和 TMA + barrier 配好的加载，实现 算、搬重叠
     idx -= kMathThreads;
     iwarp = __shfl_sync(0xFFFFFFFF, idx / 32, 0);
 
@@ -503,7 +492,14 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_kernel(
 
     tiled_mma_sv.accumulate_ = GMMA::ScaleOut::One;
 
-    wait_barrier(q_readable, 0);
+    // heads_per_group != kTileN: math warpgroup loads Q using kMathThreads threads.
+    if (heads_per_group != kTileN) {
+      load_q_group_direct_to_smem<Tin>(Q, sQ, ihead_q0, ibatch, heads_per_group, num_dim_qk,
+                                       idx, kMathThreads);
+      syncwarpgroup(iwarpgroup);
+    } else {
+      wait_barrier(q_readable, 0);
+    }
 
     int phase = 0;
     int istage_read = 0;
