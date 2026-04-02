@@ -202,12 +202,15 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_kernel(
     const __grid_constant__ TmaV tma_v, const __grid_constant__ TmaY tma_y,
     const int *block_ids_ptr, const int *num_seq_kvcache_ptr, bool new_kv_included, int num_batch,
     int num_dim_qk, int num_dim_v, int num_head_q, int num_head_k, int num_head_v,
-    int heads_per_group, int num_kvcache_blocks, int num_seq_max_blocks, float one_over_dk_log2e) {
+    int heads_per_group, int num_kvcache_blocks, int num_seq_max_blocks, float one_over_dk_log2e,
+    Tout *y_gmem_ptr, int ldY, const Tin *q_ptr, int ldQ) {
   using namespace cute;  // NOLINT
 
   int idx = threadIdx.x;
   int ihead_kv = blockIdx.x;
   int ibatch = blockIdx.y;
+  const int ihead_q0 = ihead_kv * heads_per_group;
+  const int qy_tma_head = ihead_kv;
 
   constexpr int kMathThreads = size(TiledMmaQK{});
   constexpr int kWarpsPerWrapGroup = 4;
@@ -310,11 +313,51 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_kernel(
     // cutlass::arch::warpgroup_reg_dealloc<24>();
     bool is_leader_in_load = ((iwarp == kMathThreads / 32) && elected);
 
-    if (is_leader_in_load) {
-      // Load Q
-      cute::copy(tma_q.with(q_readable), tQg(_, ihead_kv, _, ibatch), tQs(_, 0, _));
-      set_barrier_transaction_bytes(
-          q_readable, sizeof(Tin) * max(heads_per_group, size<0, 0, 1>(tQg)) * num_dim_qk);
+    if (heads_per_group == kTileN) {
+      // TMA path: all heads_per_group heads fit exactly in one TMA tile (kTileN heads).
+      if (is_leader_in_load) {
+        // Zero Q smem so TMA only fills the first heads_per_group logical rows.
+        auto *q_bytes = reinterpret_cast<unsigned char *>(shm_q);
+        for (size_t z = 0; z < cosize(SLayoutQ{}) * sizeof(Tin); ++z) {
+          q_bytes[z] = 0;
+        }
+        // Load Q: qy_tma_head == ihead_kv (tile index, valid when hpg == kTileN)
+        cute::copy(tma_q.with(q_readable), tQg(_, ihead_kv, _, ibatch), tQs(_, 0, _));
+        set_barrier_transaction_bytes(
+            q_readable, sizeof(Tin) * max(heads_per_group, size<0, 0, 1>(tQg)) * num_dim_qk);
+      }
+    } else {
+      // Direct gmem load path: heads_per_group doesn't align with TMA tile size kTileN.
+      // All 32 load-warp threads cooperate to load heads_per_group * num_dim_qk BF16 elements.
+      // Uses 128-bit (uint4) vectorized loads for 8x fewer rounds vs scalar.
+      // Safety: num_dim_qk is always a multiple of 8 (kTileK=128), so vectors never
+      // cross head boundaries. Consecutive k-values are contiguous in swizzled smem.
+      // q_ptr layout: [num_batch, num_head_q, num_dim_qk] with stride ldQ per batch.
+      const Tin *q_base = q_ptr + static_cast<ptrdiff_t>(ibatch) * ldQ + ihead_q0 * num_dim_qk;
+      const int rank_in_load_warp = idx - kMathThreads;  // 0..31
+      const int total_elems = heads_per_group * num_dim_qk;
+      constexpr int kVecSize = 8;  // uint4 = 128 bits = 8 BF16 elements
+      constexpr int kVecStride = 32 * kVecSize;  // elements covered per round by all 32 threads
+      // Vector loop: each thread loads kVecSize BF16 at once (128-bit, fully coalesced).
+      for (int base = rank_in_load_warp * kVecSize; base + kVecSize <= total_elems;
+           base += kVecStride) {
+        int lh = base / num_dim_qk;
+        int k  = base % num_dim_qk;
+        uint4 data = *reinterpret_cast<const uint4 *>(q_base + base);
+        *reinterpret_cast<uint4 *>(&sQ(lh, k)) = data;
+      }
+      // Scalar tail for any remainder not covered by the vector loop.
+      const int vec_covered = (total_elems / kVecStride) * kVecStride;
+      for (int elem = vec_covered + rank_in_load_warp; elem < total_elems; elem += 32) {
+        int lh = elem / num_dim_qk;
+        int k  = elem % num_dim_qk;
+        sQ(lh, k) = q_base[static_cast<ptrdiff_t>(lh) * num_dim_qk + k];
+      }
+      // mbarrier.arrive provides release semantics for preceding stores.
+      __syncwarp();
+      if (is_leader_in_load) {
+        arrive_barrier(q_readable);
+      }
     }
   }
 
@@ -325,6 +368,9 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_kernel(
   __syncthreads();
 
   if (idx >= kMathThreads) {
+  // 多出来的 1 个 warp
+  // 发 TMA、搬数据 和数学 warp 分工
+  // 这段线程专门做 和 TMA + barrier 配好的加载，实现 算、搬重叠
     idx -= kMathThreads;
     iwarp = __shfl_sync(0xFFFFFFFF, idx / 32, 0);
 
@@ -446,6 +492,15 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_kernel(
       for (int im = 0; im < kM; ++im) {
 #pragma unroll
         for (int in = 0; in < kN; ++in) {
+          if (in >= heads_per_group) {
+            tAttr_mn(im, in) = -std::numeric_limits<float>::infinity();
+          }
+        }
+      }
+#pragma unroll
+      for (int im = 0; im < kM; ++im) {
+#pragma unroll
+        for (int in = 0; in < kN; ++in) {
           int iposq = num_seq_kvcache + get<1>(tI_mn(im, in)) / heads_per_group;
           int iposk = itile_seq_kv * kTileM + get<0>(tI_mn(im, in));
 
@@ -515,9 +570,20 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_kernel(
         arrive_barrier(k_writable[istage_read]);
       }
 
+      auto tAttr_mn_full = retile_fragment(tAttr);
+#pragma unroll
+      for (int im = 0; im < kM; ++im) {
+#pragma unroll
+        for (int in = 0; in < kN; ++in) {
+          if (in >= heads_per_group) {
+            tAttr_mn_full(im, in) = -std::numeric_limits<float>::infinity();
+          }
+        }
+      }
+
       auto tYr_mn = retile_fragment(tYr);
       // online softmax
-      online_softmax<false, kTileN, kM, kN>(tAttr_mn, gMax, gSum, tYr_mn, one_over_dk_log2e,
+      online_softmax<false, kTileN, kM, kN>(tAttr_mn_full, gMax, gSum, tYr_mn, one_over_dk_log2e,
                                             shm_max, iwarpgroup, iwarp_in_warpgroup,
                                             ilane_in_warpgroup);
 
@@ -578,12 +644,54 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_kernel(
     cute::copy(r2s_tiled_copy, tYr4s, tYs4r);
     syncwarpgroup(iwarpgroup);
     tma_store_fence();
-    // using TMA to store
+    // Fast path: TMA store (only when heads_per_group == kTileN).
     if (is_leader_in_warpgroup) {
-      auto tYss = btma_y.partition_S(sY);  // (TMA, TMA_M, TMA_N)
-      auto tYgg = btma_y.partition_D(gY);  // (TMA, TMA_M, TMA_N, b)
+      if (heads_per_group == kTileN) {
+        auto tYss = btma_y.partition_S(sY);  // (TMA, TMA_M, TMA_N)
+        auto tYgg = btma_y.partition_D(gY);  // (TMA, TMA_M, TMA_N, b)
+        cute::copy(tma_y, tYss(_, _, 0), tYgg(_, _, qy_tma_head, ibatch));
+      }
+    }
 
-      cute::copy(tma_y, tYss(_, _, 0), tYgg(_, _, ihead_kv, ibatch));
+    // Slow path (heads_per_group != kTileN): parallel writeback using all
+    // kMathThreads threads. sY uses GMMA swizzled layout (Layout_MN_SW128_Atom);
+    // only math-warpgroup threads may access it safely. syncwarpgroup() +
+    // tma_store_fence() above guarantee sY is fully written before we read.
+    // Vectorized (uint4 = 128-bit = 8 BF16) read from smem and write to gmem:
+    //   - sY uses Swizzle<3,4,3> with 16-BF16 swizzle period; uint4 (8 BF16,
+    //     d aligned to 8) never crosses a 16-BF16 boundary -> safe.
+    //   - gmem pointer is num_dim_v-aligned so uint4 writes are always valid.
+    // Scalar fallback handles any remainder when num_dim_v % 8 != 0.
+    if (heads_per_group != kTileN) {
+      const int vec_size      = 8;  // 8 BF16 = 128-bit
+      const int num_dim_v_vec = num_dim_v / vec_size;
+      const int num_dim_v_rem = num_dim_v % vec_size;
+      // Vectorized pass: each lin corresponds to one uint4 chunk (lh, d/8)
+      const int total_vec = heads_per_group * num_dim_v_vec;
+      for (int lin = idx; lin < total_vec; lin += kMathThreads) {
+        int lh    = lin / num_dim_v_vec;
+        int d_idx = lin % num_dim_v_vec;
+        int d     = d_idx * vec_size;
+        uint4 val;
+        Tout *v16 = reinterpret_cast<Tout *>(&val);
+#pragma unroll
+        for (int i = 0; i < vec_size; ++i) {
+          v16[i] = static_cast<Tout>(static_cast<float>(sY(d + i, lh)));
+        }
+        Tout *dst = y_gmem_ptr + ibatch * ldY + (ihead_q0 + lh) * num_dim_v + d;
+        *reinterpret_cast<uint4 *>(dst) = val;
+      }
+      // Scalar remainder (only when num_dim_v % 8 != 0)
+      if (num_dim_v_rem > 0) {
+        const int d_base    = num_dim_v_vec * vec_size;
+        const int total_rem = heads_per_group * num_dim_v_rem;
+        for (int lin = idx; lin < total_rem; lin += kMathThreads) {
+          int lh = lin / num_dim_v_rem;
+          int d  = d_base + lin % num_dim_v_rem;
+          y_gmem_ptr[ibatch * ldY + (ihead_q0 + lh) * num_dim_v + d] =
+              static_cast<Tout>(static_cast<float>(sY(d, lh)));
+        }
+      }
     }
   }
 }

@@ -30,7 +30,7 @@ void launch_attention_decode_bf16_dim128_smallm(
   auto Q = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(q_ptr)),
                        make_shape(num_head_q, num_dim_qk, num_batch),
                        make_stride(num_dim_qk, Int<1>{}, ldQ));
-
+  
   auto K = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(kcache_ptr)),
                        make_shape(kBlockSize, num_dim_qk, num_head_k, num_kvcache_blocks),
                        make_stride(num_dim_qk * num_head_k, Int<1>{}, num_dim_qk, ldK));
@@ -38,7 +38,7 @@ void launch_attention_decode_bf16_dim128_smallm(
   auto V = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(vcache_ptr)),
                        make_shape(num_dim_v, kBlockSize, num_head_v, num_kvcache_blocks),
                        make_stride(Int<1>{}, num_head_v * num_dim_v, num_dim_v, ldV));
-
+  
   auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<const Tout *>(y_ptr)),
                        make_shape(num_dim_v, num_head_q, num_batch),
                        make_stride(Int<1>{}, num_dim_v, ldY));
@@ -67,12 +67,12 @@ void launch_attention_decode_bf16_dim128_smallm(
                                          make_shape(Int<kTileV>{}, Int<kBlockSize>{}));
   auto tma_copy_layout_y = tile_to_shape(GMMA::Layout_MN_SW128_Atom<Tin>{},
                                          make_shape(Int<kTileV>{}, Int<kHeadsPerGroup>{}));
-
+  
   auto tma_q = make_tma_copy(SM90_TMA_LOAD{}, Q, tma_copy_layout_q);
   auto tma_k = make_tma_copy(SM90_TMA_LOAD{}, K, tma_copy_layout_k);
   auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, V, tma_copy_layout_v);
   auto tma_y = make_tma_copy(SM90_TMA_STORE{}, Y, tma_copy_layout_y);
-
+  
   using TiledMmaQK =
       decltype(make_tiled_mma(SM90_64x8x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>{}));
   using TiledMmaSV =
@@ -102,7 +102,9 @@ void launch_attention_decode_bf16_dim128_smallm(
   kernel<<<grid, block, shm_size, stream>>>(
       tma_q, tma_k, tma_v, tma_y, block_ids_ptr, num_seq_kvcache_ptr, new_kv_included, num_batch,
       num_dim_qk, num_dim_v, num_head_q, num_head_k, num_head_v, heads_per_group,
-      num_kvcache_blocks, num_seq_max_blocks, one_over_dk_log2e);
+      num_kvcache_blocks, num_seq_max_blocks, one_over_dk_log2e,
+      reinterpret_cast<Tout *>(y_ptr), ldY,
+      reinterpret_cast<const Tin *>(q_ptr), ldQ);
 }
 
 bool smallm_dim128_async(void *y_ptr, const void *q_ptr, void *kcache_ptr, void *vcache_ptr,
@@ -112,7 +114,7 @@ bool smallm_dim128_async(void *y_ptr, const void *q_ptr, void *kcache_ptr, void 
                          int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldV,
                          cudaStream_t stream) {
   using namespace cute;  // NOLINT
-
+  
   constexpr int kTileM = 64;
   constexpr int kTileN = 8;
   constexpr int kTileK = 128;
@@ -126,7 +128,7 @@ bool smallm_dim128_async(void *y_ptr, const void *q_ptr, void *kcache_ptr, void 
   }
 
   int heads_per_group = num_head_q / num_head_k;
-  if (heads_per_group == 8 || heads_per_group == 4) {
+  if (heads_per_group <= 8) {
     constexpr int kHeadsPerGroup = 8;
     if (block_size == 32) {
       constexpr int kBlockSize = 32;

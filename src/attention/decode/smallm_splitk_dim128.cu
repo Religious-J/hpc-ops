@@ -116,7 +116,9 @@ void launch_attention_decode_bf16_dim128_smallm_splitk(
       tma_q, tma_k, tma_v, tma_y, tma_splity, reinterpret_cast<float *>(lse_ptr), block_ids_ptr,
       num_seq_kvcache_ptr, new_kv_included, num_batch, num_dim_qk, num_dim_v, num_head_q,
       num_head_k, num_head_v, heads_per_group, num_kvcache_blocks, num_seq_max_blocks,
-      one_over_dk_log2e);
+      one_over_dk_log2e, reinterpret_cast<Tout *>(y_ptr), ldY,
+      reinterpret_cast<float *>(splitk_out_ptr),
+      reinterpret_cast<const Tin *>(q_ptr), ldQ);
 }
 
 bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr, const void *q_ptr,
@@ -147,7 +149,7 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
   if (splitk == 4) {
     constexpr int kSplitK = 4;
     constexpr int kSplitMinLen = 4096;
-    if (heads_per_group == 8 || heads_per_group == 4) {
+    if (heads_per_group <= 8) {
       constexpr int kHeadsPerGroup = 8;
       if (block_size == 32) {
         constexpr int kBlockSize = 32;
@@ -167,8 +169,11 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
       }
       using Tout = __nv_bfloat16;
-      dim3 grid(num_batch);
-      dim3 block(32 * num_head_q);
+      // At most 1024 threads per block (CUDA limit). Each warp handles one head,
+      // so cap heads_per_block at 32 (= 1024 / 32) and tile extra heads in blockIdx.y.
+      int heads_per_block = std::min(num_head_q, 32);
+      dim3 grid(num_batch, (num_head_q + heads_per_block - 1) / heads_per_block);
+      dim3 block(32 * heads_per_block);
       kernels::attention_decode_bf16_smallm_splitk_combine_kernel<Tout, kTileM, kTileV, kSplitK,
                                                                   kSplitMinLen, kConsumers>
           <<<grid, block, 0, stream>>>(reinterpret_cast<Tout *>(y_ptr),
@@ -179,7 +184,7 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
   } else if (splitk == 16) {
     constexpr int kSplitK = 16;
     constexpr int kSplitMinLen = 512;
-    if (heads_per_group == 8 || heads_per_group == 4) {
+    if (heads_per_group <= 8) {
       constexpr int kHeadsPerGroup = 8;
       if (block_size == 32) {
         constexpr int kBlockSize = 32;
@@ -199,8 +204,11 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
       }
       using Tout = __nv_bfloat16;
-      dim3 grid(num_batch);
-      dim3 block(32 * num_head_q);
+      // At most 1024 threads per block (CUDA limit). Each warp handles one head,
+      // so cap heads_per_block at 32 (= 1024 / 32) and tile extra heads in blockIdx.y.
+      int heads_per_block = std::min(num_head_q, 32);
+      dim3 grid(num_batch, (num_head_q + heads_per_block - 1) / heads_per_block);
+      dim3 block(32 * heads_per_block);
       kernels::attention_decode_bf16_smallm_splitk_combine_kernel<Tout, kTileM, kTileV, kSplitK,
                                                                   kSplitMinLen, kConsumers>
           <<<grid, block, 0, stream>>>(reinterpret_cast<Tout *>(y_ptr),
