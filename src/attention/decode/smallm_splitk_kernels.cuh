@@ -451,7 +451,7 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
     // cutlass::arch::warpgroup_reg_dealloc<24>();
     bool is_leader_in_load = ((iwarp == kMathThreads / 32) && elected);
 
-    if (heads_per_group == kTileN) {
+    if ((heads_per_group == kTileN) || (num_head_q == 4 && num_head_k == 1)) {
       // TMA path: all heads_per_group heads fit exactly in one TMA tile (kTileN heads).
       if (is_leader_in_load) {
         // Load Q: ihead_kv is the tile index, valid when hpg == kTileN
@@ -742,15 +742,13 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
       syncwarpgroup(iwarpgroup);
       tma_store_fence();
       // using TMA to store (fast path: heads_per_group == kTileN)
-      if (is_leader_in_warpgroup) {
-        if (heads_per_group == kTileN) {
+      if ((heads_per_group == kTileN) || (num_head_q == 4 && num_head_k == 1)) {
+        if (is_leader_in_warpgroup) {
           auto tYss = btma_y.partition_S(sY);  // (TMA, TMA_M, TMA_N)
           auto tYgg = btma_y.partition_D(gY);  // (TMA, TMA_M, TMA_N, b)
           cute::copy(tma_y, tYss(_, _, 0), tYgg(_, _, qy_tma_head, ibatch));
         }
-      }
-
-      if (heads_per_group != kTileN) {
+      } else {
         store_sY_to_gmem_bf16<Tout>(sY, Y, ihead_q0, ibatch, heads_per_group, num_dim_v,
                                              idx, kMathThreads);
       }
@@ -768,17 +766,15 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
       tma_store_fence();
 
       // using TMA to store (fast path: heads_per_group == kTileN)
-      if (is_leader_in_warpgroup) {
-        if (heads_per_group == kTileN) {
+      if ((heads_per_group == kTileN) || (num_head_q == 4 && num_head_k == 1)) {
+        if (is_leader_in_warpgroup) {
           auto tYss = btma_splity.partition_S(sSplitY);  // (TMA, TMA_M, TMA_N)
           auto tYgg = btma_splity.partition_D(gSplitY);  // (TMA, TMA_M, TMA_N, b)
           cute::copy(tma_splity, tYss(_, _, 0), tYgg(_, _, qy_tma_head, ichunk, ibatch));
         }
-      }
-
-      if (heads_per_group != kTileN) {
-        store_sSplitY_to_gmem_float(sSplitY, splitY, ihead_q0, ichunk, ibatch,
-                                             heads_per_group, num_dim_v, idx, kMathThreads);
+      } else {
+          store_sSplitY_to_gmem_float(sSplitY, splitY, ihead_q0, ichunk, ibatch,
+                                       heads_per_group, num_dim_v, idx, kMathThreads);
       }
 
       int ilane = idx % 32;
