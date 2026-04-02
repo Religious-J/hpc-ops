@@ -194,19 +194,121 @@ __device__ __forceinline__ void load_paged_kv(TmaK &tma_k, TmaV &tma_v, uint64_t
                                 sizeof(Tin) * load_blocks * kBlockSize * num_dim_v);
 }
 
+// vectorized Q load / Y & splitY stores when heads_per_group != kTileN.
+// Swizzle safety (must stay in sync with SLayoutQ / SLayoutY / SLayoutSplitY):
+// - Q load: num_dim_qk multiple of 8; uint4 never crosses head boundaries.
+// - Y store: Swizzle period 16 BF16; d aligned to 8 => uint4 safe; float->BF16 in registers.
+// - splitY store: Swizzle period 8 floats; d aligned to 4 => float4 safe.
+
+// Preconditions: entire load warp invokes together. Linear q_base covers
+// heads_per_group * num_dim_qk Tin elements; leader signals q_readable after __syncwarp.
+template <typename Tin, typename TensorQG, typename TensorSQ>
+__device__ __forceinline__ void load_q_group_direct_to_smem(
+    TensorQG const &Q, TensorSQ &sQ, int ihead_q0, int ibatch,
+    int heads_per_group, int num_dim_qk, int rank_in_load_warp) {
+  using namespace cute;  // NOLINT
+
+  const int total_elems = heads_per_group * num_dim_qk;
+  constexpr int kVecSize   = 8;  // uint4 = 128 bits = 8 BF16 elements
+  constexpr int kVecStride = 32 * kVecSize;
+
+  const Tin *q_base = Q(ihead_q0, _, ibatch).data().get();
+  for (int base = rank_in_load_warp * kVecSize; base + kVecSize <= total_elems;
+       base += kVecStride) {
+    int lh = base / num_dim_qk;
+    int k  = base % num_dim_qk;
+    store(&sQ(lh, k), load<Tin, kVecSize>(q_base + base));
+  }
+  const int vec_covered = (total_elems / kVecStride) * kVecStride;
+  for (int elem = vec_covered + rank_in_load_warp; elem < total_elems; elem += 32) {
+    int lh = elem / num_dim_qk;
+    int k  = elem % num_dim_qk;
+    sQ(lh, k) = Q(ihead_q0 + lh, k, ibatch);  
+  }
+}
+
+// Preconditions: all kMathThreads math threads participate; prior syncwarpgroup + tma_store_fence.
+template <typename Tout, typename TensorSY, typename TensorGY>
+__device__ __forceinline__ void store_sY_to_gmem_bf16(
+    TensorSY &sY, TensorGY &Y, int ihead_q0, int ibatch, int heads_per_group, int num_dim_v,
+    int idx, int kMathThreads) {
+  using namespace cute;  // NOLINT
+
+  const int vec_size      = 8;
+  const int num_dim_v_vec = num_dim_v / vec_size;
+  const int num_dim_v_rem = num_dim_v % vec_size;
+  const int total_vec     = heads_per_group * num_dim_v_vec;
+  for (int lin = idx; lin < total_vec; lin += kMathThreads) {
+    int lh    = lin / num_dim_v_vec;
+    int d_idx = lin % num_dim_v_vec;
+    int d     = d_idx * vec_size;
+    uint4 val;
+    Tout *v16 = reinterpret_cast<Tout *>(&val);
+#pragma unroll
+    for (int i = 0; i < vec_size; ++i) {
+      v16[i] = static_cast<Tout>(static_cast<float>(sY(d + i, lh)));
+    }
+
+    store(&Y(d, ihead_q0 + lh, ibatch), load<Tout, vec_size>(v16));
+  }
+  if (num_dim_v_rem > 0) {
+    const int d_base    = num_dim_v_vec * vec_size;
+    const int total_rem = heads_per_group * num_dim_v_rem;
+    for (int lin = idx; lin < total_rem; lin += kMathThreads) {
+      int lh = lin / num_dim_v_rem;
+      int d  = d_base + lin % num_dim_v_rem;
+      Y(d, ihead_q0 + lh, ibatch) = static_cast<Tout>(static_cast<float>(sY(d, lh)));
+    }
+  }
+}
+
+// Preconditions: same as store_sY_to_gmem_bf16; splitY includes ichunk.
+template <typename TensorSSplitY, typename TensorGSplitY>
+__device__ __forceinline__ void store_sSplitY_to_gmem_float(
+    TensorSSplitY &sSplitY, TensorGSplitY &splitY, int ihead_q0, int ichunk, int ibatch,
+    int heads_per_group, int num_dim_v, int idx, int kMathThreads) {
+  using namespace cute;  // NOLINT
+
+  const int vec_size      = 4;
+  const int num_dim_v_vec = num_dim_v / vec_size;
+  const int num_dim_v_rem = num_dim_v % vec_size;
+  const int total_vec     = heads_per_group * num_dim_v_vec;
+  for (int lin = idx; lin < total_vec; lin += kMathThreads) {
+    int lh    = lin / num_dim_v_vec;
+    int d_idx = lin % num_dim_v_vec;
+    int d     = d_idx * vec_size;
+    float4 val;
+    val.x = sSplitY(d, lh);
+    val.y = sSplitY(d + 1, lh);
+    val.z = sSplitY(d + 2, lh);
+    val.w = sSplitY(d + 3, lh);
+
+    store(&splitY(d, ihead_q0 + lh, ichunk, ibatch), load<float, vec_size>(&val));
+  }
+  if (num_dim_v_rem > 0) {
+    const int d_base    = num_dim_v_vec * vec_size;
+    const int total_rem = heads_per_group * num_dim_v_rem;
+    for (int lin = idx; lin < total_rem; lin += kMathThreads) {
+      int lh = lin / num_dim_v_rem;
+      int d  = d_base + lin % num_dim_v_rem;
+      splitY(d, ihead_q0 + lh, ichunk, ibatch) = sSplitY(d, lh);
+    }
+  }
+}
+
 template <typename Tout, typename Tin, int kTileM, int kTileN, int kTileK, int kTileV,
           typename TiledMmaQK, typename TiledMmaSV, typename TmaQ, typename TmaK, typename TmaV,
-          typename TmaY, typename TmaSplitY, typename SLayoutQ, typename SLayoutK,
+          typename TmaY, typename TmaSplitY, typename TensorQ, typename TensorY, typename TensorSplitY, typename SLayoutQ, typename SLayoutK,
           typename SLayoutP, typename SLayoutS, typename SLayoutV, typename SLayoutY,
           typename SLayoutSplitY, int kBlockSize, int kStage, int kSplitK, int kSplitMinLen>
 __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
     const __grid_constant__ TmaQ tma_q, const __grid_constant__ TmaK tma_k,
     const __grid_constant__ TmaV tma_v, const __grid_constant__ TmaY tma_y,
-    const __grid_constant__ TmaSplitY tma_splity, float *lse_ptr, const int *block_ids_ptr,
-    const int *num_seq_kvcache_ptr, bool new_kv_included, int num_batch, int num_dim_qk,
-    int num_dim_v, int num_head_q, int num_head_k, int num_head_v, int heads_per_group,
-    int num_kvcache_blocks, int num_seq_max_blocks, float one_over_dk_log2e, Tout *y_gmem_ptr,
-    int ldY, float *split_fp32_ptr, const Tin *q_ptr, int ldQ) {
+    const __grid_constant__ TmaSplitY tma_splity, TensorQ Q, TensorY Y, TensorSplitY splitY, 
+    float *lse_ptr, const int *block_ids_ptr, const int *num_seq_kvcache_ptr,
+    bool new_kv_included, int num_batch, int num_dim_qk, int num_dim_v,
+    int num_head_q, int num_head_k, int num_head_v, int heads_per_group,
+    int num_kvcache_blocks, int num_seq_max_blocks, float one_over_dk_log2e) {
   using namespace cute;  // NOLINT
 
   int idx = threadIdx.x;
@@ -351,6 +453,7 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
     if (heads_per_group == kTileN) {
       // TMA path: all heads_per_group heads fit exactly in one TMA tile (kTileN heads).
       if (is_leader_in_load) {
+        // need check !!!!!!!!!!
         auto *q_bytes = reinterpret_cast<unsigned char *>(shm_q);
         for (size_t z = 0; z < cosize(SLayoutQ{}) * sizeof(Tin); ++z) {
           q_bytes[z] = 0;
@@ -361,33 +464,9 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
             q_readable, sizeof(Tin) * max(heads_per_group, size<0, 0, 1>(tQg)) * num_dim_qk);
       }
     } else {
-      // Direct gmem load path: heads_per_group doesn't align with TMA tile size kTileN.
-      // All 32 load-warp threads cooperate to load heads_per_group * num_dim_qk BF16 elements.
-      // Uses 128-bit (uint4) vectorized loads for 8x fewer rounds vs scalar.
-      // Safety: num_dim_qk is always a multiple of 8 (kTileK=128), so vectors never
-      // cross head boundaries. Consecutive k-values are contiguous in swizzled smem.
-      // q_ptr layout: [num_batch, num_head_q, num_dim_qk] with stride ldQ per batch.
-      const Tin *q_base = q_ptr + static_cast<ptrdiff_t>(ibatch) * ldQ + ihead_q0 * num_dim_qk;
       const int rank_in_load_warp = idx - kMathThreads;  // 0..31
-      const int total_elems = heads_per_group * num_dim_qk;
-      constexpr int kVecSize = 8;  // uint4 = 128 bits = 8 BF16 elements
-      constexpr int kVecStride = 32 * kVecSize;  // elements covered per round by all 32 threads
-      // Vector loop: each thread loads kVecSize BF16 at once (128-bit, fully coalesced).
-      for (int base = rank_in_load_warp * kVecSize; base + kVecSize <= total_elems;
-           base += kVecStride) {
-        int lh = base / num_dim_qk;
-        int k  = base % num_dim_qk;
-        uint4 data = *reinterpret_cast<const uint4 *>(q_base + base);
-        *reinterpret_cast<uint4 *>(&sQ(lh, k)) = data;
-      }
-      // Scalar tail for any remainder not covered by the vector loop.
-      const int vec_covered = (total_elems / kVecStride) * kVecStride;
-      for (int elem = vec_covered + rank_in_load_warp; elem < total_elems; elem += 32) {
-        int lh = elem / num_dim_qk;
-        int k  = elem % num_dim_qk;
-        sQ(lh, k) = q_base[static_cast<ptrdiff_t>(lh) * num_dim_qk + k];
-      }
-      // mbarrier.arrive provides release semantics for preceding stores.
+      load_q_group_direct_to_smem<Tin>(Q, sQ, ihead_q0, ibatch, heads_per_group, num_dim_qk,
+                                  rank_in_load_warp);
       __syncwarp();
       if (is_leader_in_load) {
         arrive_barrier(q_readable);
@@ -676,47 +755,9 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
         }
       }
 
-      // Slow path (heads_per_group != kTileN): parallel writeback using all
-      // kMathThreads threads. sY uses GMMA swizzled layout; only safe to
-      // access from within the math warpgroup. syncwarpgroup() + tma_store_fence()
-      // above already guarantee sY is fully written before we read it.
-      // Vectorized (uint4 = 128-bit = 8 BF16) read from smem and write to gmem:
-      //   - sY uses Swizzle<3,4,3> with 16-BF16 swizzle period; uint4 (8 BF16,
-      //     d aligned to 8) never crosses a 16-BF16 boundary -> safe.
-      //   - gmem pointer is num_dim_v-aligned so uint4 writes are always valid.
-      // Scalar fallback handles any remainder when num_dim_v % 8 != 0.
       if (heads_per_group != kTileN) {
-        const int vec_size     = 8;  // 8 BF16 = 128-bit
-        const int num_dim_v_vec = num_dim_v / vec_size;
-        const int num_dim_v_rem = num_dim_v % vec_size;
-        // Vectorized pass: each lin corresponds to one uint4 chunk (lh, d/8)
-        const int total_vec = heads_per_group * num_dim_v_vec;
-        for (int lin = idx; lin < total_vec; lin += kMathThreads) {
-          int lh    = lin / num_dim_v_vec;
-          int d_idx = lin % num_dim_v_vec;
-          int d     = d_idx * vec_size;
-          // Read 8 consecutive BF16 from swizzled smem (safe within 16-BF16 period)
-          // Pack into uint4 via manual conversion from float register
-          uint4 val;
-          Tout *v16 = reinterpret_cast<Tout *>(&val);
-#pragma unroll
-          for (int i = 0; i < vec_size; ++i) {
-            v16[i] = static_cast<Tout>(static_cast<float>(sY(d + i, lh)));
-          }
-          Tout *dst = y_gmem_ptr + ibatch * ldY + (ihead_q0 + lh) * num_dim_v + d;
-          *reinterpret_cast<uint4 *>(dst) = val;
-        }
-        // Scalar remainder (only when num_dim_v % 8 != 0)
-        if (num_dim_v_rem > 0) {
-          const int d_base = num_dim_v_vec * vec_size;
-          const int total_rem = heads_per_group * num_dim_v_rem;
-          for (int lin = idx; lin < total_rem; lin += kMathThreads) {
-            int lh = lin / num_dim_v_rem;
-            int d  = d_base + lin % num_dim_v_rem;
-            y_gmem_ptr[ibatch * ldY + (ihead_q0 + lh) * num_dim_v + d] =
-                static_cast<Tout>(static_cast<float>(sY(d, lh)));
-          }
-        }
+        store_sY_to_gmem_bf16<Tout>(sY, Y, ihead_q0, ibatch, heads_per_group, num_dim_v,
+                                             idx, kMathThreads);
       }
     } else {
       // Epilogue: write register-C to global memory
@@ -740,51 +781,9 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
         }
       }
 
-      // Slow path (heads_per_group != kTileN): parallel writeback using all
-      // kMathThreads threads. sSplitY uses a GMMA swizzled layout that is only
-      // safely accessible from within the math warpgroup (load warpgroup threads
-      // must NOT touch it), so we stay inside the else branch here.
-      // Vectorized (float4 = 128-bit) read from smem and write to gmem:
-      //   - sSplitY uses Swizzle<3,4,3> with 8-float swizzle period; float4
-      //     (4 floats, d aligned to 4) never crosses an 8-float boundary -> safe.
-      //   - gmem pointer is num_dim_v-aligned, so float4 writes are always valid.
-      // Scalar fallback handles any remainder when num_dim_v % 4 != 0.
       if (heads_per_group != kTileN) {
-        const size_t split_stride_batch =
-            static_cast<size_t>(num_dim_v) * num_head_q * kSplitK;
-        const size_t split_stride_chunk = static_cast<size_t>(num_dim_v) * num_head_q;
-        const int vec_size  = 4;  // float4
-        const int num_dim_v_vec = num_dim_v / vec_size;
-        const int num_dim_v_rem = num_dim_v % vec_size;
-        // Vectorized pass: each lin corresponds to one float4 chunk (lh, d/4)
-        const int total_vec = heads_per_group * num_dim_v_vec;
-        for (int lin = idx; lin < total_vec; lin += kMathThreads) {
-          int lh    = lin / num_dim_v_vec;
-          int d_idx = lin % num_dim_v_vec;
-          int d     = d_idx * vec_size;
-          // Read 4 consecutive floats from swizzled smem (safe within 8-float period)
-          float4 val;
-          val.x = sSplitY(d,     lh);
-          val.y = sSplitY(d + 1, lh);
-          val.z = sSplitY(d + 2, lh);
-          val.w = sSplitY(d + 3, lh);
-          float *dst = split_fp32_ptr + ibatch * split_stride_batch +
-                       ichunk * split_stride_chunk +
-                       static_cast<size_t>(ihead_q0 + lh) * num_dim_v + d;
-          *reinterpret_cast<float4 *>(dst) = val;
-        }
-        // Scalar remainder (only when num_dim_v % 4 != 0, e.g. num_dim_v=130)
-        if (num_dim_v_rem > 0) {
-          const int d_base = num_dim_v_vec * vec_size;
-          const int total_rem = heads_per_group * num_dim_v_rem;
-          for (int lin = idx; lin < total_rem; lin += kMathThreads) {
-            int lh = lin / num_dim_v_rem;
-            int d  = d_base + lin % num_dim_v_rem;
-            split_fp32_ptr[ibatch * split_stride_batch + ichunk * split_stride_chunk +
-                           static_cast<size_t>(ihead_q0 + lh) * num_dim_v + d] =
-                sSplitY(d, lh);
-          }
-        }
+        store_sSplitY_to_gmem_float(sSplitY, splitY, ihead_q0, ichunk, ibatch,
+                                             heads_per_group, num_dim_v, idx, kMathThreads);
       }
 
       int ilane = idx % 32;
