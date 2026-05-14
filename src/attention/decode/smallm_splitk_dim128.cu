@@ -57,7 +57,7 @@ void launch_attention_decode_bf16_dim128_smallm_splitk(
                        make_stride(Int<1>{}, num_head_v * num_dim_v, num_dim_v, ldV));
 
   auto Y = make_tensor(
-      make_gmem_ptr(reinterpret_cast<const Tout *>(y_ptr)),
+      make_gmem_ptr(reinterpret_cast<Tout *>(y_ptr)),
       make_shape(num_dim_v, heads_per_group, num_head_k, num_seq_q, num_batch),
       make_stride(Int<1>{}, num_dim_v, heads_per_group * num_dim_v, ldY, ldY * num_seq_q));
 
@@ -128,6 +128,7 @@ void launch_attention_decode_bf16_dim128_smallm_splitk(
   auto kernel = kernels::attention_decode_bf16_multistage_ws_smallm_splitk_kernel<
       Tout, Tin, kTileM, kTileN, kTileK, kTileV, kHeadsPerGroup, TiledMmaQK, TiledMmaSV,
       decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_y), decltype(tma_splity),
+      decltype(Q), decltype(Y), decltype(splitY),
       decltype(slayout_q), decltype(slayout_k), decltype(slayout_p), decltype(slayout_s),
       decltype(slayout_v), decltype(slayout_y), decltype(slayout_splity), kBlockSize, kStage,
       kSplitK, kSplitMinLen>;
@@ -136,7 +137,8 @@ void launch_attention_decode_bf16_dim128_smallm_splitk(
   int pad_heads_per_group = ((heads_per_group + 7) / 8) * 8;
 
   kernel<<<grid, block, shm_size, stream>>>(
-      tma_q, tma_k, tma_v, tma_y, tma_splity, reinterpret_cast<Tout *>(y_ptr),
+      tma_q, tma_k, tma_v, tma_y, tma_splity, Q, Y, splitY,
+      reinterpret_cast<Tout *>(y_ptr),
       reinterpret_cast<float *>(splitk_out_ptr), reinterpret_cast<float *>(lse_ptr), block_ids_ptr,
       num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_dim_qk,
       num_dim_v, num_head_q, num_head_k, num_head_v, heads_per_group, pad_heads_per_group,

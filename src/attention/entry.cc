@@ -237,8 +237,8 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
   int num_seq_max_blocks = block_ids.size(1);
 
   int heads_per_group = num_head_q / num_head_k;
-  TORCH_CHECK(heads_per_group == 4 || heads_per_group == 8,
-              "we only support num_head_q / num_head_k == 4 or 8.");
+  TORCH_CHECK(heads_per_group > 1 && heads_per_group <= 8,
+              "we only support 1 < num_head_q / num_head_k <= 8.");
 
   const auto *q_ptr = q.const_data_ptr();
   auto *kcache_ptr = kcache.mutable_data_ptr();
@@ -274,9 +274,9 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
   if (splitk > 1) {
     int pad_heads_per_group = ((heads_per_group + 7) / 8) * 8;
     lse = torch::empty({num_batch, splitk, num_head_k, num_seq_q, pad_heads_per_group},
-                       q.options().dtype(torch::kFloat32));
+                           q.options().dtype(torch::kFloat32));
     split_out = torch::empty({num_batch, splitk, num_seq_q, num_head_q, num_dim_v},
-                             q.options().dtype(torch::kFloat32));
+                                 q.options().dtype(torch::kFloat32));
     if (split_flag.has_value()) {
       split_flag_tensor = split_flag.value();
     } else {
@@ -351,8 +351,8 @@ torch::Tensor attention_decode_fp8_entry(const torch::Tensor &q, torch::Tensor &
   int qscale_pad_stride = qscale.stride(0);
 
   int heads_per_group = num_head_q / num_head_k;
-  TORCH_CHECK(heads_per_group == 4 || heads_per_group == 8,
-              "we only support num_head_q / num_head_k == 4 or 8.");
+  TORCH_CHECK(heads_per_group > 1 && heads_per_group <= 8,
+              "we only support 1 < num_head_q / num_head_k <= 8.");
 
   const auto *q_ptr = q.const_data_ptr();
   auto *kcache_ptr = kcache.mutable_data_ptr();
