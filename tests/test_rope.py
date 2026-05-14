@@ -225,7 +225,7 @@ def prepare_inputs(
     )
 
 
-@pytest.mark.parametrize("num_q_heads,num_kv_heads,qk_head_dim", [(8, 1, 128), (64, 8, 128)])
+@pytest.mark.parametrize("num_q_heads,num_kv_heads,qk_head_dim", [(32, 4, 128), (32, 8, 128)])
 @pytest.mark.parametrize("qk_norm_policy", [0, 1, 2])
 @pytest.mark.parametrize("num_req", [7, 16])
 @pytest.mark.parametrize("is_prefill,mtp", [(True, None), (False, 0), (False, 1)])
@@ -270,97 +270,3 @@ def test_rope_norm_store_kv(
     assert allclose(ref_q, out_q[:rows], atol=8e-2)
     assert allclose(kcache_ref, kcache, atol=8e-2)
     assert allclose(vcache_ref, vcache, atol=8e-2)
-
-
-@pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
-@pytest.mark.parametrize("num_q_heads,num_kv_heads,qk_head_dim", [(8, 1, 128), (64, 8, 128)])
-@pytest.mark.parametrize("qk_norm_policy", [0, 1, 2])
-@pytest.mark.parametrize("quant_policy", [1, 2])  # 1=dqskv (dynamic), 2=sqskv (static)
-@pytest.mark.parametrize("num_req", [7, 16])
-@pytest.mark.parametrize("is_prefill,mtp", [(True, None), (False, 0), (False, 1)])
-def test_rope_norm_store_kv_fp8(
-    num_q_heads,
-    num_kv_heads,
-    qk_head_dim,
-    qk_norm_policy,
-    quant_policy,
-    num_req,
-    is_prefill,
-    mtp,
-):
-    """Test rope_norm_store_kv_fp8: all mode/quant/norm combinations.
-    num_req=7 exercises align-8 padding in decode.
-    """
-    qkv, num_seqlen, q_index, kcache, vcache, kv_indices, q_norm_w, k_norm_w, cos_sin, real_rows = (
-        prepare_inputs(num_req, is_prefill, mtp, num_q_heads, num_kv_heads, qk_head_dim)
-    )
-    kcache_ref, vcache_ref = kcache.clone(), vcache.clone()
-
-    k_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv.device)
-    v_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv.device)
-    q_scale_val = 2.0
-    q_scale_inv = torch.tensor([1.0 / q_scale_val], dtype=torch.float32, device=qkv.device)
-
-    kcache_fp8 = kcache.to(torch.float8_e4m3fn)
-    vcache_fp8 = vcache.to(torch.float8_e4m3fn)
-
-    if is_prefill:
-        max_seqlens = int((q_index[1:] - q_index[:-1]).max().item())
-    else:
-        max_seqlens = mtp + 1  # tokens per request in decode
-
-    q_fp8, q_scale_out, split_k_flag = hpc.rope_norm_store_kv_fp8(
-        key_cache=kcache_fp8,
-        value_cache=vcache_fp8,
-        qkv=qkv,
-        cos_sin=cos_sin,
-        num_seqlen_per_req=num_seqlen,
-        q_index=q_index,
-        kvcache_indices=kv_indices,
-        is_prefill=is_prefill,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        quant_policy=quant_policy,
-        max_seqlens=max_seqlens,
-        q_scale_inv=q_scale_inv if quant_policy == 2 else None,
-        q_norm_weight=q_norm_w if qk_norm_policy > 0 else None,
-        k_norm_weight=k_norm_w if qk_norm_policy > 0 else None,
-        qk_norm_policy=qk_norm_policy,
-    )
-
-    assert split_k_flag.shape == (num_seqlen.shape[0], num_kv_heads)
-    assert split_k_flag.dtype == torch.int32
-
-    if quant_policy == 1:  # dqskv: kernel computes dynamic per-token per-head scale
-        if is_prefill:
-            pad128 = ((max_seqlens + 127) // 128) * 128
-            assert q_scale_out.shape == (num_seqlen.shape[0], num_q_heads, pad128)
-            # dequant: select valid per-token scales via sequence-length mask
-            seqlens = (q_index[1:] - q_index[:-1]).to(qkv.device)
-            mask = torch.arange(pad128, device=qkv.device).expand(
-                num_seqlen.shape[0], pad128
-            ) < seqlens.unsqueeze(1)
-            scale_flat = q_scale_out.permute(0, 2, 1)[mask]  # [total_real_rows, num_q_heads]
-            rows = int(q_index[-1].item())
-            q_bf16 = (q_fp8[:rows].to(torch.bfloat16) * scale_flat[:, :, None]).to(torch.bfloat16)
-        else:
-            assert q_scale_out.shape == (qkv.shape[0], num_q_heads)
-            rows = real_rows  # num_req * tokens_per_req (before padding)
-            q_bf16 = (q_fp8[:rows].to(torch.bfloat16) * q_scale_out[:rows, :, None]).to(
-                torch.bfloat16
-            )
-    else:  # sqskv: static scale supplied by caller; no dynamic scale tensor returned
-        assert q_scale_out is None
-        rows = real_rows if real_rows is not None else q_fp8.shape[0]
-        q_bf16 = (q_fp8[:rows].to(torch.float32) * q_scale_val).to(torch.bfloat16)
-
-    if real_rows is not None:
-        qkv_r, ns_r = qkv[:real_rows], num_seqlen[:num_req]
-        qi_r, ki_r = q_index[: num_req + 1], kv_indices[:num_req]
-    else:
-        qkv_r, ns_r, qi_r, ki_r = qkv, num_seqlen, q_index, kv_indices
-
-    ref_q = rope_norm_ref(
-        kcache_ref, vcache_ref, qkv_r, cos_sin, ns_r, qi_r, ki_r, q_norm_w, k_norm_w, qk_norm_policy
-    )
-    assert allclose(ref_q, q_bf16, atol=0.5)

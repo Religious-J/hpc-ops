@@ -702,6 +702,18 @@ void rope_norm_store_kv_async(__nv_bfloat16 *out_q_ptr, __nv_bfloat16 *kcache_pt
         num_seqlen_per_req_ptr, q_index_ptr, kvcache_indices_ptr, q_norm_weight_ptr,
         k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
         max_num_kv_block_per_batch, kv_block_size_divider, num_rows, qk_norm_policy, stream);
+  } else if (num_q_heads == 32 && num_kv_heads == 4 && qk_head_dim == 128 && v_head_dim == 128) {
+    launch_rope_norm_store_kv<32, 4, 128, 128>(
+        out_q_ptr, kcache_ptr, vcache_ptr, out_k_ptr, out_v_ptr, in_qkv_ptr, cos_sin_ptr,
+        num_seqlen_per_req_ptr, q_index_ptr, kvcache_indices_ptr, q_norm_weight_ptr,
+        k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
+        max_num_kv_block_per_batch, kv_block_size_divider, num_rows, qk_norm_policy, stream);
+  } else if (num_q_heads == 32 && num_kv_heads == 8 && qk_head_dim == 128 && v_head_dim == 128) {
+    launch_rope_norm_store_kv<32, 8, 128, 128>(
+        out_q_ptr, kcache_ptr, vcache_ptr, out_k_ptr, out_v_ptr, in_qkv_ptr, cos_sin_ptr,
+        num_seqlen_per_req_ptr, q_index_ptr, kvcache_indices_ptr, q_norm_weight_ptr,
+        k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
+        max_num_kv_block_per_batch, kv_block_size_divider, num_rows, qk_norm_policy, stream);
   } else {
     throw std::invalid_argument("rope_norm_store_kv_async: unsupported config, got: q_heads=" +
                                 std::to_string(num_q_heads) +
