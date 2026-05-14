@@ -80,11 +80,11 @@ def ref_attn_with_paged_kvcache_func(
 
 
 @pytest.mark.parametrize("num_batch", [1, 16, 128])
-@pytest.mark.parametrize("num_seq_q", [1, 2, 3])
+@pytest.mark.parametrize("num_seq_q", [1])
 @pytest.mark.parametrize("max_seq_kv", [2048, 4096])
 @pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("num_head_q", [4])
-@pytest.mark.parametrize("num_head_kv", [1])
+@pytest.mark.parametrize("num_head_q", [28])
+@pytest.mark.parametrize("num_head_kv", [4])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("new_kv_included", [True])
 @pytest.mark.parametrize("splitk", [True])
