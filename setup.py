@@ -26,7 +26,10 @@ class CMakeBuild(build_ext):
         os.makedirs(build_lib_dir, exist_ok=True)
         os.makedirs(build_temp_dir, exist_ok=True)
 
-        cmake_args = [f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={build_lib_dir}", *ext.version_macros]
+        cmake_args = [
+            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={build_lib_dir}",
+            *ext.version_macros,
+        ]
 
         subprocess.check_call(["cmake", ext.sourcedir] + cmake_args, cwd=build_temp_dir)
         subprocess.check_call(
@@ -36,6 +39,16 @@ class CMakeBuild(build_ext):
         so_src_path = os.path.join(build_temp_dir, "_C.abi3.so")
         so_dst_path = os.path.join(build_lib_dir, "hpc/_C.abi3.so")
         shutil.copy(so_src_path, so_dst_path)
+
+        # Also copy the .so back into the source tree so that editable installs
+        # (pip install -e .) load the freshly built binary.  Without this the
+        # hpc/__init__.py in the source directory keeps loading the stale .so
+        # that was there before the build, causing hard-to-diagnose crashes.
+        src_tree_so = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "hpc", "_C.abi3.so"
+        )
+        if os.path.abspath(so_dst_path) != src_tree_so:
+            shutil.copy(so_src_path, src_tree_so)
 
 
 def get_version():

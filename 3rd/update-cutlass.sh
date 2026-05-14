@@ -4,7 +4,6 @@ rm -rf cutlass
 rm -rf cutlass.git
 
 git clone https://github.com/NVIDIA/cutlass.git cutlass.git
-git -C ./cutlass.git checkout da5e086
 
 mkdir -p cutlass 
 mv cutlass.git/include cutlass/
