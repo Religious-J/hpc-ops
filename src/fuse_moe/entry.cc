@@ -12,8 +12,76 @@
 namespace hpc {
 namespace fuse_moe {
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-           torch::Tensor, torch::Tensor, torch::Tensor>
+// ---- Workspace helper utilities ----
+
+static inline size_t align128(size_t x) { return (x + 127) & ~size_t(127); }
+
+static inline void *slice_workspace(void *base, size_t &offset, size_t size) {
+  void *ptr = static_cast<int8_t *>(base) + offset;
+  offset = align128(offset + size);
+  return ptr;
+}
+
+// ---- get_workspace_size: return required workspace bytes ----
+
+int64_t get_workspace_size_pertensor_fp8_entry(int64_t max_num_tokens, int64_t hidden_size,
+                                               int64_t intermediate_size, int64_t num_topk,
+                                               int64_t num_expert_local) {
+  int64_t T = max_num_tokens, K = num_topk, H = hidden_size;
+  int64_t I = intermediate_size;  // gate_up_weight.size(1), already includes gate+up
+  int64_t E = num_expert_local;
+
+  size_t total = 0;
+  total = align128(total + T * K * H);        // gate_up_input (fp8, 1B)
+  total = align128(total + T * K * I * 2);     // gate_up_output (bf16, 2B)
+  total = align128(total + E * 2 * 128);       // gate_up_tmas (int8, 1B)
+  total = align128(total + T * K * (I / 2));   // down_input (fp8, 1B)
+  total = align128(total + T * K * H * 2);     // down_output (bf16, 2B)
+  total = align128(total + E * 2 * 128);       // down_tmas (int8, 1B)
+  total = align128(total + T * K * 4);         // topk_pos (int32, 4B)
+  total = align128(total + E * 4);             // seqlens (int32, 4B)
+  total = align128(total + (E + 1) * 4);       // cu_seqlens (int32, 4B)
+  total = align128(total + E * 4);             // tiles (int32, 4B)
+  total = align128(total + (E + 1) * 4);       // cu_tiles (int32, 4B)
+
+  return static_cast<int64_t>(total);
+}
+
+int64_t get_workspace_size_blockwise_fp8_entry(int64_t max_num_tokens, int64_t hidden_size,
+                                               int64_t intermediate_size, int64_t num_topk,
+                                               int64_t num_expert_local,
+                                               int64_t num_expert_total) {
+  int64_t T = max_num_tokens, K = num_topk, H = hidden_size;
+  int64_t I = intermediate_size;  // gate_up_weight.size(1), already includes gate+up
+  int64_t E = num_expert_local;
+
+  // Use max aligned_size=64 to compute upper-bound padded tokens
+  int64_t aligned_size = 64;
+  int64_t P = (T * K + num_expert_total * aligned_size + aligned_size - 1) / aligned_size *
+              aligned_size;
+
+  size_t total = 0;
+  total = align128(total + T * K * H);              // gate_up_input (fp8, 1B)
+  total = align128(total + (H / 128) * P * 4);      // gate_up_input_scale (fp32, 4B)
+  total = align128(total + T * K * I * 2);           // gate_up_output (bf16, 2B)
+  total = align128(total + E * 2 * 128);             // gate_up_tmas (int8, 1B)
+  total = align128(total + T * K * (I / 2));         // down_input (fp8, 1B)
+  total = align128(total + (I / 2 / 128) * P * 4);  // down_input_scale (fp32, 4B)
+  total = align128(total + T * K * H * 2);           // down_output (bf16, 2B)
+  total = align128(total + E * 2 * 128);             // down_tmas (int8, 1B)
+  total = align128(total + T * K * 4);               // topk_pos (int32, 4B)
+  total = align128(total + E * 4);                   // num_tokens_per_group (int32, 4B)
+  total = align128(total + (E + 1) * 4);             // cu_num_tokens_per_group (int32, 4B)
+  total = align128(total + E * 4);                   // tiles (int32, 4B)
+  total = align128(total + (E + 1) * 4);             // cu_tiles (int32, 4B)
+
+  return static_cast<int64_t>(total);
+}
+
+// ---- Existing entry functions (unchanged) ----
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 count_and_gather_entry(const torch::Tensor &x, const torch::Tensor &topk_ids,
                        const int64_t num_expert, const int64_t rank_ep,
                        const int64_t intermediate_size, const int64_t num_seq_per_group_avg) {
@@ -118,12 +186,15 @@ torch::Tensor reduce_entry(const torch::Tensor &x, const torch::Tensor &topk_pos
   return y;
 }
 
-torch::Tensor fuse_moe_pertensor_fp8_entry(
+// ---- fuse_moe_pertensor_fp8 (workspace version, zero-alloc) ----
+
+void fuse_moe_pertensor_fp8_entry(
     const torch::Tensor &x, const torch::Tensor &gate_up_weight, const torch::Tensor &down_weight,
     const torch::Tensor &gate_up_scale, const torch::Tensor &down_scale,
     const torch::Tensor &act_and_mul_scale, const torch::Tensor &topk_ids,
     const torch::Tensor &topk_scale, const std::optional<torch::Tensor> &shared_output,
-    int64_t rank_ep, int64_t num_expert_total, bool use_bf16_mul) {
+    const torch::Tensor &workspace, const torch::Tensor &output, int64_t rank_ep,
+    int64_t num_expert_total, bool use_bf16_mul) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
@@ -171,23 +242,39 @@ torch::Tensor fuse_moe_pertensor_fp8_entry(
   int num_topk = topk_ids.size(1);
   TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
 
-  auto options = x.options();
-  torch::Tensor y = torch::empty({num_seq, hidden_size}, options.dtype(torch::kBFloat16));
+  // Output validation
+  TORCH_CHECK(output.device().is_cuda(), "output tensor must be cuda");
+  TORCH_CHECK(output.is_contiguous(), "output tensor must be contiguous");
+  TORCH_CHECK(output.dtype() == torch::kBFloat16, "output tensor dtype must be bfloat16");
+  TORCH_CHECK(output.size(0) == num_seq && output.size(1) == hidden_size,
+              "output tensor shape must be [num_seq, hidden_size]");
 
-  torch::Tensor gate_up_input = torch::empty({num_seq * num_topk, hidden_size}, options);
-  torch::Tensor gate_up_output =
-      torch::empty({num_seq * num_topk, intermediate_size}, options.dtype(torch::kBFloat16));
-  torch::Tensor gate_up_tmas = torch::empty({num_expert * 2, 128}, options.dtype(torch::kInt8));
-  torch::Tensor down_input = torch::empty({num_seq * num_topk, intermediate_size / 2}, options);
-  torch::Tensor down_output =
-      torch::empty({num_seq * num_topk, hidden_size}, options.dtype(torch::kBFloat16));
-  torch::Tensor down_tmas = torch::empty({num_expert * 2, 128}, options.dtype(torch::kInt8));
+  // Workspace validation
+  TORCH_CHECK(workspace.device().is_cuda(), "workspace must be on CUDA");
+  TORCH_CHECK(workspace.is_contiguous(), "workspace must be contiguous");
 
-  torch::Tensor topk_pos = torch::empty({num_seq, num_topk}, options.dtype(torch::kInt32));
-  torch::Tensor seqlens = torch::zeros({num_expert}, options.dtype(torch::kInt32));
-  torch::Tensor cu_seqlens = torch::empty({num_expert + 1}, options.dtype(torch::kInt32));
-  torch::Tensor tiles = torch::empty({num_expert}, options.dtype(torch::kInt32));
-  torch::Tensor cu_tiles = torch::empty({num_expert + 1}, options.dtype(torch::kInt32));
+  // --- Slice pointers from pre-allocated workspace ---
+  auto *ws_base = workspace.mutable_data_ptr<int8_t>();
+  size_t ws_off = 0;
+
+  auto *gate_up_input_ptr = slice_workspace(ws_base, ws_off, (size_t)num_seq * num_topk * hidden_size);
+  auto *gate_up_output_ptr = slice_workspace(ws_base, ws_off, (size_t)num_seq * num_topk * intermediate_size * 2);
+  auto *gate_up_tmas_ptr = slice_workspace(ws_base, ws_off, (size_t)num_expert * 2 * 128);
+  auto *down_input_ptr = slice_workspace(ws_base, ws_off, (size_t)num_seq * num_topk * (intermediate_size / 2));
+  auto *down_output_ptr = slice_workspace(ws_base, ws_off, (size_t)num_seq * num_topk * hidden_size * 2);
+  auto *down_tmas_ptr = slice_workspace(ws_base, ws_off, (size_t)num_expert * 2 * 128);
+  auto *topk_pos_ptr = slice_workspace(ws_base, ws_off, (size_t)num_seq * num_topk * 4);
+  auto *seqlens_ptr = slice_workspace(ws_base, ws_off, (size_t)num_expert * 4);
+  auto *cu_seqlens_ptr = slice_workspace(ws_base, ws_off, (size_t)(num_expert + 1) * 4);
+  auto *tiles_ptr = slice_workspace(ws_base, ws_off, (size_t)num_expert * 4);
+  auto *cu_tiles_ptr = slice_workspace(ws_base, ws_off, (size_t)(num_expert + 1) * 4);
+
+  TORCH_CHECK(ws_off <= static_cast<size_t>(workspace.numel()),
+              "workspace too small: need ", ws_off, " bytes but got ", workspace.numel());
+
+  // NOTE: seqlens is zeroed by the count_and_gather kernel at the end of each call
+  // (self-clearing design). The caller must ensure workspace is zero-initialized
+  // before the FIRST call (e.g. use torch.zeros when allocating workspace).
 
   const auto *x_ptr = x.const_data_ptr();
   const auto *topk_ids_ptr = topk_ids.const_data_ptr();
@@ -198,18 +285,7 @@ torch::Tensor fuse_moe_pertensor_fp8_entry(
   const auto *down_weight_ptr = down_weight.const_data_ptr();
   const auto *down_scale_ptr = down_scale.const_data_ptr();
 
-  auto *y_ptr = y.mutable_data_ptr();
-  auto *topk_pos_ptr = topk_pos.mutable_data_ptr();
-  auto *seqlens_ptr = seqlens.mutable_data_ptr();
-  auto *cu_seqlens_ptr = cu_seqlens.mutable_data_ptr();
-  auto *tiles_ptr = tiles.mutable_data_ptr();
-  auto *cu_tiles_ptr = cu_tiles.mutable_data_ptr();
-  auto *gate_up_input_ptr = gate_up_input.mutable_data_ptr();
-  auto *gate_up_output_ptr = gate_up_output.mutable_data_ptr();
-  auto *gate_up_tmas_ptr = gate_up_tmas.mutable_data_ptr();
-  auto *down_input_ptr = down_input.mutable_data_ptr();
-  auto *down_output_ptr = down_output.mutable_data_ptr();
-  auto *down_tmas_ptr = down_tmas.mutable_data_ptr();
+  auto *y_ptr = output.mutable_data_ptr();
 
   fuse_moe_pertensor_fp8_async(
       y_ptr, x_ptr, gate_up_input_ptr, gate_up_output_ptr, gate_up_weight_ptr, gate_up_scale_ptr,
@@ -217,16 +293,17 @@ torch::Tensor fuse_moe_pertensor_fp8_entry(
       down_scale_ptr, down_tmas_ptr, topk_ids_ptr, topk_scale_ptr, topk_pos_ptr, seqlens_ptr,
       cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr, shared_output_ptr, num_seq, hidden_size,
       intermediate_size, num_topk, num_expert_total, num_expert, rank_ep, use_bf16_mul, stream);
-
-  return y;
 }
 
-torch::Tensor fuse_moe_blockwise_fp8_entry(
+// ---- fuse_moe_blockwise_fp8 (workspace version, zero-alloc) ----
+
+void fuse_moe_blockwise_fp8_entry(
     const torch::Tensor &x, const torch::Tensor &x_scale, const torch::Tensor &gate_up_weight,
     const torch::Tensor &gate_up_weight_scale, const torch::Tensor &down_weight,
     const torch::Tensor &down_weight_scale, const torch::Tensor &topk_ids,
     const torch::Tensor &topk_scale, const std::optional<torch::Tensor> &shared_output,
-    int64_t rank_ep, int64_t num_expert_total) {
+    const torch::Tensor &workspace, const torch::Tensor &output, int64_t rank_ep,
+    int64_t num_expert_total) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
@@ -305,28 +382,41 @@ torch::Tensor fuse_moe_blockwise_fp8_entry(
       (num_tokens * num_topk + num_expert_total * aligned_size + aligned_size - 1) / aligned_size *
       aligned_size;
 
-  auto options = x.options();
-  torch::Tensor y = torch::empty({num_tokens, hidden_size}, options.dtype(torch::kBFloat16));
-  torch::Tensor gate_up_input =
-      torch::empty({num_tokens * num_topk, hidden_size}, options.dtype(torch::kFloat8_e4m3fn));
-  torch::Tensor gate_up_input_scale =
-      torch::empty({x_scale.size(1), num_padded_tokens}, options.dtype(torch::kFloat32));
-  torch::Tensor gate_up_output =
-      torch::empty({num_tokens * num_topk, intermediate_size}, options.dtype(torch::kBFloat16));
-  torch::Tensor gate_up_tmas = torch::empty({num_experts * 2, 128}, options.dtype(torch::kInt8));
-  torch::Tensor down_input = torch::empty({num_tokens * num_topk, intermediate_size / 2},
-                                          options.dtype(torch::kFloat8_e4m3fn));
-  torch::Tensor down_input_scale = torch::empty({intermediate_size / 2 / 128, num_padded_tokens},
-                                                options.dtype(torch::kFloat32));
-  torch::Tensor down_output =
-      torch::empty({num_tokens * num_topk, hidden_size}, options.dtype(torch::kBFloat16));
-  torch::Tensor down_tmas = torch::empty({num_experts * 2, 128}, options.dtype(torch::kInt8));
-  torch::Tensor topk_pos = torch::empty({num_tokens, num_topk}, options.dtype(torch::kInt32));
-  torch::Tensor num_tokens_per_group = torch::zeros({num_experts}, options.dtype(torch::kInt32));
-  torch::Tensor cu_num_tokens_per_group =
-      torch::empty({num_experts + 1}, options.dtype(torch::kInt32));
-  torch::Tensor tiles = torch::empty({num_experts}, options.dtype(torch::kInt32));
-  torch::Tensor cu_tiles = torch::empty({num_experts + 1}, options.dtype(torch::kInt32));
+  // Output validation
+  TORCH_CHECK(output.device().is_cuda(), "output tensor must be cuda");
+  TORCH_CHECK(output.is_contiguous(), "output tensor must be contiguous");
+  TORCH_CHECK(output.dtype() == torch::kBFloat16, "output tensor dtype must be bfloat16");
+  TORCH_CHECK(output.size(0) == num_tokens && output.size(1) == hidden_size,
+              "output tensor shape must be [num_tokens, hidden_size]");
+
+  // Workspace validation
+  TORCH_CHECK(workspace.device().is_cuda(), "workspace must be on CUDA");
+  TORCH_CHECK(workspace.is_contiguous(), "workspace must be contiguous");
+
+  // --- Slice pointers from pre-allocated workspace ---
+  auto *ws_base = workspace.mutable_data_ptr<int8_t>();
+  size_t ws_off = 0;
+
+  auto *gate_up_input_ptr = slice_workspace(ws_base, ws_off, (size_t)num_tokens * num_topk * hidden_size);
+  auto *gate_up_input_scale_ptr = slice_workspace(ws_base, ws_off, (size_t)(hidden_size / 128) * num_padded_tokens * 4);
+  auto *gate_up_output_ptr = slice_workspace(ws_base, ws_off, (size_t)num_tokens * num_topk * intermediate_size * 2);
+  auto *gate_up_tmas_ptr = slice_workspace(ws_base, ws_off, (size_t)num_experts * 2 * 128);
+  auto *down_input_ptr = slice_workspace(ws_base, ws_off, (size_t)num_tokens * num_topk * (intermediate_size / 2));
+  auto *down_input_scale_ptr = slice_workspace(ws_base, ws_off, (size_t)(intermediate_size / 2 / 128) * num_padded_tokens * 4);
+  auto *down_output_ptr = slice_workspace(ws_base, ws_off, (size_t)num_tokens * num_topk * hidden_size * 2);
+  auto *down_tmas_ptr = slice_workspace(ws_base, ws_off, (size_t)num_experts * 2 * 128);
+  auto *topk_pos_ptr = slice_workspace(ws_base, ws_off, (size_t)num_tokens * num_topk * 4);
+  auto *num_tokens_per_group_ptr = slice_workspace(ws_base, ws_off, (size_t)num_experts * 4);
+  auto *cu_num_tokens_per_group_ptr = slice_workspace(ws_base, ws_off, (size_t)(num_experts + 1) * 4);
+  auto *tiles_ptr = slice_workspace(ws_base, ws_off, (size_t)num_experts * 4);
+  auto *cu_tiles_ptr = slice_workspace(ws_base, ws_off, (size_t)(num_experts + 1) * 4);
+
+  TORCH_CHECK(ws_off <= static_cast<size_t>(workspace.numel()),
+              "workspace too small: need ", ws_off, " bytes but got ", workspace.numel());
+
+  // NOTE: num_tokens_per_group is zeroed by the blockwise_count_and_gather kernel
+  // at the end of each call (self-clearing design). The caller must ensure workspace
+  // is zero-initialized before the FIRST call (e.g. use torch.zeros when allocating).
 
   const auto *x_ptr = x.const_data_ptr();
   const auto *x_scale_ptr = x_scale.const_data_ptr();
@@ -337,20 +427,7 @@ torch::Tensor fuse_moe_blockwise_fp8_entry(
   const auto *down_weight_ptr = down_weight.const_data_ptr();
   const auto *down_weight_scale_ptr = down_weight_scale.const_data_ptr();
 
-  auto *y_ptr = y.mutable_data_ptr();
-  auto *topk_pos_ptr = topk_pos.mutable_data_ptr();
-  auto *num_tokens_per_group_ptr = num_tokens_per_group.mutable_data_ptr();
-  auto *cu_num_tokens_per_group_ptr = cu_num_tokens_per_group.mutable_data_ptr();
-  auto *tiles_ptr = tiles.mutable_data_ptr();
-  auto *cu_tiles_ptr = cu_tiles.mutable_data_ptr();
-  auto *gate_up_input_ptr = gate_up_input.mutable_data_ptr();
-  auto *gate_up_input_scale_ptr = gate_up_input_scale.mutable_data_ptr();
-  auto *gate_up_output_ptr = gate_up_output.mutable_data_ptr();
-  auto *gate_up_tmas_ptr = gate_up_tmas.mutable_data_ptr();
-  auto *down_input_ptr = down_input.mutable_data_ptr();
-  auto *down_input_scale_ptr = down_input_scale.mutable_data_ptr();
-  auto *down_output_ptr = down_output.mutable_data_ptr();
-  auto *down_tmas_ptr = down_tmas.mutable_data_ptr();
+  auto *y_ptr = output.mutable_data_ptr();
 
   fuse_moe_blockwise_fp8_async(
       y_ptr, x_ptr, x_scale_ptr, gate_up_input_ptr, gate_up_input_scale_ptr, gate_up_output_ptr,
@@ -360,7 +437,6 @@ torch::Tensor fuse_moe_blockwise_fp8_entry(
       cu_num_tokens_per_group_ptr, tiles_ptr, cu_tiles_ptr, shared_output_ptr, num_tokens,
       num_padded_tokens, hidden_size, intermediate_size, num_topk, num_expert_total, num_experts,
       gate_up_weight_scale_lastdim_pad4, down_weight_scale_lastdim_pad4, rank_ep, stream);
-  return y;
 }
 
 }  // namespace fuse_moe
@@ -378,12 +454,24 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       ") -> (Tensor)");
   m.impl("reduce", torch::kCUDA, &hpc::fuse_moe::reduce_entry);
 
+  m.def("get_workspace_size_pertensor_fp8(int max_num_tokens, int hidden_size, "
+        "int intermediate_size, int num_topk, int num_expert_local) -> int");
+  m.impl("get_workspace_size_pertensor_fp8",
+         &hpc::fuse_moe::get_workspace_size_pertensor_fp8_entry);
+
+  m.def("get_workspace_size_blockwise_fp8(int max_num_tokens, int hidden_size, "
+        "int intermediate_size, int num_topk, int num_expert_local, "
+        "int num_expert_total) -> int");
+  m.impl("get_workspace_size_blockwise_fp8",
+         &hpc::fuse_moe::get_workspace_size_blockwise_fp8_entry);
+
   m.def(
       "fuse_moe_pertensor_fp8(Tensor x, Tensor gate_up_weight, Tensor down_weight, Tensor "
       "gate_up_scale, "
       "Tensor down_scale, Tensor act_and_mul_scale, Tensor topk_ids, Tensor topk_scale, Tensor ? "
       "shared_output, "
-      "int rank_ep, int num_expert_total, bool use_bf16_mul) -> (Tensor)");
+      "Tensor workspace, Tensor output, "
+      "int rank_ep, int num_expert_total, bool use_bf16_mul) -> ()");
   m.impl("fuse_moe_pertensor_fp8", torch::kCUDA, &hpc::fuse_moe::fuse_moe_pertensor_fp8_entry);
 
   m.def(
@@ -391,6 +479,7 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "gate_up_weight_scale, "
       "Tensor down_weight, Tensor down_weight_scale, Tensor topk_ids, Tensor topk_scale, Tensor ? "
       "shared_output, "
-      "int rank_ep, int num_expert_total) -> (Tensor)");
+      "Tensor workspace, Tensor output, "
+      "int rank_ep, int num_expert_total) -> ()");
   m.impl("fuse_moe_blockwise_fp8", torch::kCUDA, &hpc::fuse_moe::fuse_moe_blockwise_fp8_entry);
 }

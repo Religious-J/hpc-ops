@@ -78,7 +78,9 @@ def count_and_gather(
         - The function modifies the output buffers in-place when provided
         - Expert assignments in topk_ids should be in range [0, num_expert-1]
     """
-    return torch.ops.hpc.count_and_gather(x, topk_ids, num_expert, rank_ep, intermediate_size)
+    return torch.ops.hpc.count_and_gather(
+        x, topk_ids, num_expert, rank_ep, intermediate_size
+    )
 
 
 def reduce(
@@ -126,6 +128,81 @@ def reduce(
     return torch.ops.hpc.reduce(x, topk_pos, topk_scale, shared_output)
 
 
+def get_workspace_size_pertensor_fp8(
+    max_num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_topk: int,
+    num_expert_local: int,
+) -> int:
+    """Returns the workspace size in bytes for fuse_moe_pertensor_fp8.
+
+    Call this once during initialization, then allocate the workspace:
+        ws_size = get_workspace_size_pertensor_fp8(...)
+        workspace = torch.zeros(ws_size, dtype=torch.int8, device="cuda")
+
+    IMPORTANT: Use torch.zeros (not torch.empty) to ensure the workspace is
+    zero-initialized before the first call. The kernel maintains a self-clearing
+    invariant for internal counters after each call.
+
+    Args:
+        max_num_tokens: Maximum number of tokens (e.g. cuda_graph_max_bs)
+        hidden_size: Model hidden size
+        intermediate_size: gate_up_weight.size(1), i.e. real_intermediate * 2
+        num_topk: Number of top-k experts per token
+        num_expert_local: Number of experts on the local device
+
+    Returns:
+        int: Required workspace size in bytes
+    """
+    return torch.ops.hpc.get_workspace_size_pertensor_fp8(
+        max_num_tokens,
+        hidden_size,
+        intermediate_size,
+        num_topk,
+        num_expert_local,
+    )
+
+
+def get_workspace_size_blockwise_fp8(
+    max_num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_topk: int,
+    num_expert_local: int,
+    num_expert_total: int,
+) -> int:
+    """Returns the workspace size in bytes for fuse_moe_blockwise_fp8.
+
+    Call this once during initialization, then allocate the workspace:
+        ws_size = get_workspace_size_blockwise_fp8(...)
+        workspace = torch.zeros(ws_size, dtype=torch.int8, device="cuda")
+
+    IMPORTANT: Use torch.zeros (not torch.empty) to ensure the workspace is
+    zero-initialized before the first call. The kernel maintains a self-clearing
+    invariant for internal counters after each call.
+
+    Args:
+        max_num_tokens: Maximum number of tokens (e.g. cuda_graph_max_bs)
+        hidden_size: Model hidden size
+        intermediate_size: gate_up_weight.size(1), i.e. real_intermediate * 2
+        num_topk: Number of top-k experts per token
+        num_expert_local: Number of experts on the local device
+        num_expert_total: Total number of experts across all devices
+
+    Returns:
+        int: Required workspace size in bytes
+    """
+    return torch.ops.hpc.get_workspace_size_blockwise_fp8(
+        max_num_tokens,
+        hidden_size,
+        intermediate_size,
+        num_topk,
+        num_expert_local,
+        num_expert_total,
+    )
+
+
 def fuse_moe_pertensor_fp8(
     x: Tensor,
     gate_up_weight: Tensor,
@@ -137,14 +214,16 @@ def fuse_moe_pertensor_fp8(
     topk_scale: Tensor,
     rank_ep: int,
     num_expert_total: int,
+    workspace: Tensor,
+    output: Tensor,
     use_bf16_mul: bool = True,
     shared_output: Tensor = None,
-) -> Tensor:
+) -> None:
     """Performs Mixture of Experts (MoE) forward operation with FP8 precision.
 
-    This function executes the MoE computation with all matrix multiplications
-    performed in FP8 precision for improved performance and memory efficiency.
-    The gate and up projections are fused into a single matrix multiplication.
+    This is a zero-allocation function: all buffers including the output tensor
+    must be pre-allocated by the caller. Results are written into ``output``
+    in-place.
 
     Args:
         x: Input activation tensor
@@ -175,31 +254,24 @@ def fuse_moe_pertensor_fp8(
             Dtype: int32
         num_expert_total: the total number of expert
             Dtype: int32
+        workspace: Pre-allocated workspace tensor from get_workspace_size_pertensor_fp8
+            Shape: [workspace_size]
+            Dtype: int8
+        output: Pre-allocated output tensor, written in-place
+            Shape: [num_seq, hidden_size]
+            Dtype: bfloat16
         use_bf16_mul: use bf16 for silu mul or not.
         shared_output: output for shared experts, default is None
             Shape: [num_seq, hidden_size]
             Dtype: bfloat16
 
-    Returns:
-        torch.Tensor: Output tensor after MoE computation
-            Shape: [num_seq, hidden_size]
-            Dtype: bfloat16
-
-    Raises:
-        RuntimeError: If the input tensors have incompatible shapes or types,
-            or if CUDA kernel execution fails.
-        ValueError: If the intermediate_size is not divisible by 2 for gate/up split.
-
     Note:
         - All input tensors must be on CUDA device
-        - The gate and up projections are combined into a single matrix multiplication
         - FP8 precision is used for all matrix operations (torch.float8_e4m3fn)
         - Activation function used is SiLU (Swish)
-        - Token routing is determined by topk_ids and weighted by topk_scale
-        - Output scaling is applied to maintain numerical stability in FP8
     """
 
-    return torch.ops.hpc.fuse_moe_pertensor_fp8(
+    torch.ops.hpc.fuse_moe_pertensor_fp8(
         x,
         gate_up_weight,
         down_weight,
@@ -209,6 +281,8 @@ def fuse_moe_pertensor_fp8(
         topk_ids,
         topk_scale,
         shared_output,
+        workspace,
+        output,
         rank_ep,
         num_expert_total,
         use_bf16_mul,
@@ -226,16 +300,15 @@ def fuse_moe_blockwise_fp8(
     topk_scale: Tensor,
     rank_ep: int,
     num_expert_total: int,
+    workspace: Tensor,
+    output: Tensor,
     shared_output: Tensor = None,
-) -> Tensor:
-    """Performs Mixture of Experts (MoE) forward operation with FP8 precision.
+) -> None:
+    """Performs Mixture of Experts (MoE) forward operation with FP8 blockwise precision.
 
-    It only supports blockwise quantization of weights and inputs, with a block
-    size of 128.
-
-    This function executes the MoE computation with all matrix multiplications
-    performed in FP8 precision for improved performance and memory efficiency.
-    The gate and up projections are fused into a single matrix multiplication.
+    This is a zero-allocation function: all buffers including the output tensor
+    must be pre-allocated by the caller. Results are written into ``output``
+    in-place.
 
     Args:
         x: Input activation tensor
@@ -247,15 +320,13 @@ def fuse_moe_blockwise_fp8(
         gate_up_weight: Combined weight tensor for gate and up projections
             Shape: [num_expert_local, intermediate_size * 2, hidden_size]
             Dtype: fp8
-        gate_up_weight_scale: Scaling factors for gate_up_weight, should pad the last dim to 64,
-                              so hidden_size must be smaller than 64*128
+        gate_up_weight_scale: Scaling factors for gate_up_weight
             Shape: [num_expert_local, intermediate_size * 2 / 128, 64]
             Dtype: fp32
         down_weight: Weight tensor for down projection
             Shape: [num_expert_local, hidden_size, intermediate_size]
             Dtype: fp8
-        down_weight_scale: Scaling factors for down_weight, should pad the last dim to 64,
-                           so intermediate_size must be smaller than 64*128
+        down_weight_scale: Scaling factors for down_weight
             Shape: [num_expert_local, hidden_size / 128, 64]
             Dtype: float32
         topk_ids: Token indices assigned to each expert
@@ -268,15 +339,22 @@ def fuse_moe_blockwise_fp8(
             Dtype: int32
         num_expert_total: the total number of expert
             Dtype: int32
+        workspace: Pre-allocated workspace tensor from get_workspace_size_blockwise_fp8
+            Shape: [workspace_size]
+            Dtype: int8
+        output: Pre-allocated output tensor, written in-place
+            Shape: [num_tokens, hidden_size]
+            Dtype: bfloat16
         shared_output: output for shared experts, default is None
             Shape: [num_seq, hidden_size]
             Dtype: bfloat16
-    Returns:
-        torch.Tensor: Output tensor after MoE computation
-            Shape: [num_tokens, hidden_size]
-            Dtype: bfloat16
+
+    Note:
+        - All input tensors must be on CUDA device
+        - FP8 precision is used for all matrix operations (torch.float8_e4m3fn)
+        - Block size for quantization is 128
     """
-    return torch.ops.hpc.fuse_moe_blockwise_fp8(
+    torch.ops.hpc.fuse_moe_blockwise_fp8(
         x,
         x_scale,
         gate_up_weight,
@@ -286,6 +364,8 @@ def fuse_moe_blockwise_fp8(
         topk_ids,
         topk_scale,
         shared_output,
+        workspace,
+        output,
         rank_ep,
         num_expert_total,
     )
@@ -296,9 +376,13 @@ def count_and_gather_fake(
     x, topk_ids, num_expert, rank_ep, intermediate_size, num_seq_per_group_avg
 ):
     return (
-        torch.empty((topk_ids.shape[0] * topk_ids.shape[1], x.shape[1]), dtype=torch.float8_e4m3fn),
         torch.empty(
-            (topk_ids.shape[0] * topk_ids.shape[1], intermediate_size), dtype=torch.bfloat16
+            (topk_ids.shape[0] * topk_ids.shape[1], x.shape[1]),
+            dtype=torch.float8_e4m3fn,
+        ),
+        torch.empty(
+            (topk_ids.shape[0] * topk_ids.shape[1], intermediate_size),
+            dtype=torch.bfloat16,
         ),
         torch.empty((topk_ids.shape[0] * topk_ids.shape[1]), dtype=torch.int32),
         torch.empty((num_expert), dtype=torch.int32),
@@ -324,25 +408,30 @@ def fuse_moe_pertensor_fp8_fake(
     act_and_mul_scale,
     topk_ids,
     topk_scale,
+    shared_output,
+    workspace,
+    output,
     rank_ep,
     num_expert_total,
     use_bf16_mul,
 ):
-    return torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
+    return None
 
 
 @torch.library.register_fake("hpc::fuse_moe_blockwise_fp8")
 def fuse_moe_blockwise_fp8_fake(
-    x: Tensor,
-    x_scale: Tensor,
-    gate_up_weight: Tensor,
-    gate_up_weight_scale: Tensor,
-    down_weight: Tensor,
-    down_weight_scale: Tensor,
-    topk_ids: Tensor,
-    topk_scale: Tensor,
-    rank_ep: int,
-    num_expert_total: int,
-    use_bf16_mul: bool = True,
+    x,
+    x_scale,
+    gate_up_weight,
+    gate_up_weight_scale,
+    down_weight,
+    down_weight_scale,
+    topk_ids,
+    topk_scale,
+    shared_output,
+    workspace,
+    output,
+    rank_ep,
+    num_expert_total,
 ):
-    return torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
+    return None
