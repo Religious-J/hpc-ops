@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Tencent.
+
 import os
 import shutil
 import subprocess
@@ -38,6 +40,7 @@ class CMakeBuild(build_ext):
 
         so_src_path = os.path.join(build_temp_dir, "_C.abi3.so")
         so_dst_path = os.path.join(build_lib_dir, "hpc/_C.abi3.so")
+        os.makedirs(os.path.dirname(so_dst_path), exist_ok=True)
         shutil.copy(so_src_path, so_dst_path)
 
         # Also copy the .so back into the source tree so that editable installs

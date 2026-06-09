@@ -50,7 +50,8 @@ void launch_group_gemm_bf16(void *y_ptr, const void *x_ptr, const void *w_ptr,
                                 kGroupPerThread, kThreadPerBlock>
         <<<num_group + 1, kThreadPerBlock, 0, stream>>>(
             td_xy, tma_xy, (const Tin *)x_ptr, (const Tout *)y_ptr, (const int *)seqlens_ptr,
-            (const int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m, n, k);
+            (const int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, nullptr,
+            num_group, m, n, k, 0);
   }
 
   // 1. group gemm
