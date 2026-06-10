@@ -13,11 +13,11 @@ namespace hpc {
 namespace group_gemm {
 
 template <int kTileM, int kTileN, int kTileK, int kStage, int kWarpgroupM, int kWarpgroupN,
-          int kSwizzleX, int kSwizzleW, int kSwizzleY>
+          int kSwizzleX, int kSwizzleW, int kSwizzleY, bool kUsePDL = false>
 void launch_group_gemm_bf16(void *y_ptr, const void *x_ptr, const void *w_ptr,
                            const void *seqlens_ptr, const void *cu_seqlens_ptr,
                            void *tmas_ptr, void *tiles_ptr, void *cu_tiles_ptr, int num_group,
-                           int m, int n, int k, bool update_tma, cudaStream_t stream) {
+                           int m, int n, int k, bool update_tma, bool use_pdl, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   using Tin = cute::bfloat16_t;
@@ -70,22 +70,54 @@ void launch_group_gemm_bf16(void *y_ptr, const void *x_ptr, const void *w_ptr,
       constexpr bool IsLoopH = true;
       auto kernel =
           kernels::group_gemm_bf16_kernel<decltype(config), decltype(tma_x),
-                                                   decltype(tma_w), decltype(tma_y), IsLoopH>;
+                                                   decltype(tma_w), decltype(tma_y), IsLoopH, kUsePDL>;
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
-      kernel<<<grid, block, shm_size, stream>>>(tma_w, tma_xy, (int *)seqlens_ptr,
-                                                (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m,
-                                                n, k, flat_divider);
+      if constexpr (kUsePDL) {
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        cudaLaunchConfig_t launch_config = {};
+        launch_config.gridDim = grid;
+        launch_config.blockDim = block;
+        launch_config.dynamicSmemBytes = shm_size;
+        launch_config.stream = stream;
+        launch_config.attrs = attrs;
+        launch_config.numAttrs = 1;
+        cudaLaunchKernelEx(&launch_config, kernel, tma_w, tma_xy, (int *)seqlens_ptr,
+                           (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m, n, k,
+                           flat_divider);
+      } else {
+        kernel<<<grid, block, shm_size, stream>>>(tma_w, tma_xy, (int *)seqlens_ptr,
+                                                  (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group,
+                                                  m, n, k, flat_divider);
+      }
     } else {
       constexpr bool IsLoopH = false;
       auto kernel =
           kernels::group_gemm_bf16_kernel<decltype(config), decltype(tma_x),
-                                                   decltype(tma_w), decltype(tma_y), IsLoopH>;
+                                                   decltype(tma_w), decltype(tma_y), IsLoopH, kUsePDL>;
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
-      kernel<<<grid, block, shm_size, stream>>>(tma_w, tma_xy, (int *)seqlens_ptr,
-                                                (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m,
-                                                n, k, flat_divider);
+      if constexpr (kUsePDL) {
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        cudaLaunchConfig_t launch_config = {};
+        launch_config.gridDim = grid;
+        launch_config.blockDim = block;
+        launch_config.dynamicSmemBytes = shm_size;
+        launch_config.stream = stream;
+        launch_config.attrs = attrs;
+        launch_config.numAttrs = 1;
+        cudaLaunchKernelEx(&launch_config, kernel, tma_w, tma_xy, (int *)seqlens_ptr,
+                           (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m, n, k,
+                           flat_divider);
+      } else {
+        kernel<<<grid, block, shm_size, stream>>>(tma_w, tma_xy, (int *)seqlens_ptr,
+                                                  (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group,
+                                                  m, n, k, flat_divider);
+      }
     }
   }
 }
@@ -94,7 +126,7 @@ void group_gemm_bf16_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                                     const void *seqlens_ptr, const void *cu_seqlens_ptr,
                                     void *tmas_ptr, void *tiles_ptr,
                                     void *cu_tiles_ptr, int num_group, int m, int n, int k,
-                                    int num_seq_per_group_avg, bool update_tma,
+                                    int num_seq_per_group_avg, bool update_tma, bool use_pdl,
                                     cudaStream_t stream) {
   constexpr int kTileN = 128;
   constexpr int kTileK = 64;
@@ -103,35 +135,43 @@ void group_gemm_bf16_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
   constexpr int kSwizzleX = 128;
   constexpr int kSwizzleW = 128;
   constexpr int kSwizzleY = 64;
+
+#define LAUNCH_BF16_GEMM(TileM)                                                                    \
+  do {                                                                                             \
+    constexpr int kTileM = TileM;                                                                  \
+    constexpr int kStage = 8;                                                                      \
+    if (use_pdl) {                                                                                 \
+      launch_group_gemm_bf16<kTileM, kTileN, kTileK, kStage, kWarpgroupM, kWarpgroupN, kSwizzleX, \
+                             kSwizzleW, kSwizzleY, true>(                                          \
+          y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, tmas_ptr, tiles_ptr, cu_tiles_ptr,     \
+          num_group, m, n, k, update_tma, use_pdl, stream);                                        \
+    } else {                                                                                       \
+      launch_group_gemm_bf16<kTileM, kTileN, kTileK, kStage, kWarpgroupM, kWarpgroupN, kSwizzleX, \
+                             kSwizzleW, kSwizzleY, false>(                                         \
+          y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, tmas_ptr, tiles_ptr, cu_tiles_ptr,     \
+          num_group, m, n, k, update_tma, use_pdl, stream);                                        \
+    }                                                                                              \
+  } while (0)
+
   if (num_seq_per_group_avg <= 16) {
-    constexpr int kTileM = 16;
-    constexpr int kStage = 8;
-    launch_group_gemm_bf16<kTileM, kTileN, kTileK, kStage, kWarpgroupM, kWarpgroupN, kSwizzleX,
-                          kSwizzleW, kSwizzleY>(y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr,
-                                                tmas_ptr, tiles_ptr, cu_tiles_ptr,
-                                                num_group, m, n, k, update_tma, stream);
+    LAUNCH_BF16_GEMM(16);
   } else if (num_seq_per_group_avg <= 32) {
-    constexpr int kTileM = 32;
-    constexpr int kStage = 8;
-    launch_group_gemm_bf16<kTileM, kTileN, kTileK, kStage, kWarpgroupM, kWarpgroupN, kSwizzleX,
-                          kSwizzleW, kSwizzleY>(y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr,
-                                                tmas_ptr, tiles_ptr, cu_tiles_ptr,
-                                                num_group, m, n, k, update_tma, stream);
+    LAUNCH_BF16_GEMM(32);
   } else if (num_seq_per_group_avg <= 48) {
-    constexpr int kTileM = 48;
-    constexpr int kStage = 8;
-    launch_group_gemm_bf16<kTileM, kTileN, kTileK, kStage, kWarpgroupM, kWarpgroupN, kSwizzleX,
-                          kSwizzleW, kSwizzleY>(y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr,
-                                                tmas_ptr, tiles_ptr, cu_tiles_ptr,
-                                                num_group, m, n, k, update_tma, stream);
+    LAUNCH_BF16_GEMM(48);
+  } else if (num_seq_per_group_avg <= 64) {
+    LAUNCH_BF16_GEMM(64);
+  } else if (num_seq_per_group_avg <= 96) {
+    LAUNCH_BF16_GEMM(48);
+  } else if (num_seq_per_group_avg <= 128) {
+    LAUNCH_BF16_GEMM(32);
+  } else if (num_seq_per_group_avg <= 144) {
+    LAUNCH_BF16_GEMM(48);
   } else {
-    constexpr int kTileM = 64;
-    constexpr int kStage = 8;
-    launch_group_gemm_bf16<kTileM, kTileN, kTileK, kStage, kWarpgroupM, kWarpgroupN, kSwizzleX,
-                          kSwizzleW, kSwizzleY>(y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr,
-                                                tmas_ptr, tiles_ptr, cu_tiles_ptr,
-                                                num_group, m, n, k, update_tma, stream);
+    LAUNCH_BF16_GEMM(64);
   }
+
+#undef LAUNCH_BF16_GEMM
 }
 
 }  // namespace group_gemm

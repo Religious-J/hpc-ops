@@ -269,6 +269,7 @@ def fuse_moe_bf16(
     rank_ep: int,
     num_expert_total: int,
     shared_output: Tensor = None,
+    output: Tensor = None,
 ) -> Tensor:
     """Performs Mixture of Experts (MoE) forward operation with BF16 precision.
 
@@ -299,6 +300,9 @@ def fuse_moe_bf16(
         shared_output: output for shared experts, default is None
             Shape: [num_seq, hidden_size]
             Dtype: bfloat16
+        output: Optional pre-allocated output tensor to avoid memory allocation
+            Shape: [num_seq, hidden_size]
+            Dtype: bfloat16
 
     Returns:
         torch.Tensor: Output tensor after MoE computation
@@ -325,6 +329,7 @@ def fuse_moe_bf16(
         shared_output,
         rank_ep,
         num_expert_total,
+        output,
     )
 
 
@@ -452,8 +457,13 @@ def fuse_moe_bf16_fake(
     down_weight: Tensor,
     topk_ids: Tensor,
     topk_scale: Tensor,
-    shared_output: Tensor,
+    shared_output,
     rank_ep: int,
     num_expert_total: int,
+    output,
 ):
-    return torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
+    return (
+        output
+        if output is not None
+        else torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
+    )

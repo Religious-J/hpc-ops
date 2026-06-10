@@ -641,7 +641,8 @@ torch::Tensor fuse_moe_blockwise_entry(
 torch::Tensor fuse_moe_bf16_entry(
     const torch::Tensor &x, const torch::Tensor &gate_up_weight, const torch::Tensor &down_weight,
     const torch::Tensor &topk_ids, const torch::Tensor &topk_scale,
-    const std::optional<torch::Tensor> &shared_output, int64_t rank_ep, int64_t num_expert_total) {
+    const std::optional<torch::Tensor> &shared_output, int64_t rank_ep, int64_t num_expert_total,
+    std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
@@ -687,10 +688,22 @@ torch::Tensor fuse_moe_bf16_entry(
   int num_expert = gate_up_weight.size(0);
   int intermediate_size = gate_up_weight.size(1);
   int num_topk = topk_ids.size(1);
+  int num_seq_per_group_avg = num_seq * num_topk / num_expert_total;
   TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
 
   auto options = x.options();
-  torch::Tensor y = torch::empty({num_seq, hidden_size}, options.dtype(torch::kBFloat16));
+  torch::Tensor y;
+  void *y_ptr = nullptr;
+  if (output.has_value()) {
+    TORCH_CHECK(output.value().size(0) == num_seq && output.value().size(1) == hidden_size,
+                "output shape must be [num_seq, hidden_size]");
+    TORCH_CHECK(output.value().dtype() == torch::kBFloat16, "output dtype must be bfloat16");
+    TORCH_CHECK(output.value().device().is_cuda(), "output must be cuda tensor");
+    y_ptr = output.value().mutable_data_ptr();
+  } else {
+    y = torch::empty({num_seq, hidden_size}, options.dtype(torch::kBFloat16));
+    y_ptr = y.mutable_data_ptr();
+  }
 
   torch::Tensor gate_up_input = torch::empty({num_seq * num_topk, hidden_size}, options);
   torch::Tensor gate_up_output =
@@ -707,13 +720,33 @@ torch::Tensor fuse_moe_bf16_entry(
   torch::Tensor tiles = torch::empty({num_expert}, options.dtype(torch::kInt32));
   torch::Tensor cu_tiles = torch::empty({num_expert + 1}, options.dtype(torch::kInt32));
 
+  // Compute task_map and wave counts (aligned with blockwise_fp8 optimization)
+  int num_sm = get_sm_count();
+  constexpr int kTileN = 128;
+  int num_gateup_tiles = ((num_seq + num_seq_per_group_avg - 1) / num_seq_per_group_avg) *
+                         ((intermediate_size + kTileN - 1) / kTileN) * num_expert;
+  int num_down_tiles = ((num_seq + num_seq_per_group_avg - 1) / num_seq_per_group_avg) *
+                       ((hidden_size + kTileN - 1) / kTileN) * num_expert;
+  int num_gateup_waves = (num_gateup_tiles + num_sm - 1) / num_sm + 1;
+  int num_down_waves = (num_down_tiles + num_sm - 1) / num_sm + 1;
+  torch::Tensor gateup_task_map;
+  torch::Tensor down_task_map;
+  void *gateup_task_map_ptr = nullptr;
+  void *down_task_map_ptr = nullptr;
+
+  if (num_seq_per_group_avg <= 8) {
+    gateup_task_map = torch::empty({num_gateup_waves, num_sm, 4}, options.dtype(torch::kInt32));
+    gateup_task_map_ptr = gateup_task_map.mutable_data_ptr();
+    down_task_map = torch::empty({num_down_waves, num_sm, 4}, options.dtype(torch::kInt32));
+    down_task_map_ptr = down_task_map.mutable_data_ptr();
+  }
+
   const auto *x_ptr = x.const_data_ptr();
   const auto *topk_ids_ptr = topk_ids.const_data_ptr();
   const auto *topk_scale_ptr = topk_scale.const_data_ptr();
   const auto *gate_up_weight_ptr = gate_up_weight.const_data_ptr();
   const auto *down_weight_ptr = down_weight.const_data_ptr();
 
-  auto *y_ptr = y.mutable_data_ptr();
   auto *topk_pos_ptr = topk_pos.mutable_data_ptr();
   auto *seqlens_ptr = seqlens.mutable_data_ptr();
   auto *cu_seqlens_ptr = cu_seqlens.mutable_data_ptr();
@@ -730,10 +763,15 @@ torch::Tensor fuse_moe_bf16_entry(
       y_ptr, x_ptr, gate_up_input_ptr, gate_up_output_ptr, gate_up_weight_ptr, gate_up_tmas_ptr,
       down_input_ptr, down_output_ptr, down_weight_ptr, down_tmas_ptr,
       topk_ids_ptr, topk_scale_ptr, topk_pos_ptr, seqlens_ptr,
-      cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr, shared_output_ptr, num_seq, hidden_size,
+      cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr, shared_output_ptr, gateup_task_map_ptr,
+      down_task_map_ptr, num_gateup_waves, num_down_waves, num_seq, hidden_size,
       intermediate_size, num_topk, num_expert_total, num_expert, rank_ep, stream);
 
-  return y;
+  if (output.has_value()) {
+    return output.value();
+  } else {
+    return y;
+  }
 }
 
 
@@ -784,6 +822,6 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
       "fuse_moe_bf16(Tensor x, Tensor gate_up_weight, Tensor down_weight, "
       "Tensor topk_ids, Tensor topk_scale, Tensor ? shared_output, "
-      "int rank_ep, int num_expert_total) -> (Tensor)");
+      "int rank_ep, int num_expert_total, Tensor ? output) -> (Tensor)");
   m.impl("fuse_moe_bf16", torch::kCUDA, &hpc::fuse_moe::fuse_moe_bf16_entry);
 }
