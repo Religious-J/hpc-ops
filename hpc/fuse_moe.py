@@ -180,7 +180,32 @@ def fuse_moe_pertensor_fp8(
     use_bf16_mul: bool = True,
     shared_output: Tensor = None,
 ) -> Tensor:
-    """Run per-tensor FP8 FusedMoE."""
+    """Run per-tensor FP8 FusedMoE.
+
+    Uses the SM90 (Hopper) CuTe DSL pipeline:
+        count+gather -> grouped GEMM -> act+quant -> grouped GEMM -> reduce
+    The grouped GEMMs run a pure CuTe DSL FP8 kernel (no C++ dependency).
+    Falls back to the C++ kernel only if the CuTe DSL path is unavailable.
+    """
+    try:
+        from hpc.cute_fuse_moe import fuse_moe_pertensor_fp8 as cute_fuse_moe_fn
+
+        return cute_fuse_moe_fn(
+            x,
+            gate_up_weight,
+            down_weight,
+            gate_up_scale,
+            down_scale,
+            act_and_mul_scale,
+            topk_ids,
+            topk_scale,
+            rank_ep,
+            num_expert_total,
+            use_bf16_mul,
+            shared_output,
+        )
+    except (ImportError, Exception):
+        pass  # Fall back to C++ kernel
 
     return torch.ops.hpc.fuse_moe_pertensor_fp8(
         x,
@@ -265,9 +290,13 @@ def count_and_gather_fake(
     x, topk_ids, num_expert, rank_ep, intermediate_size, num_seq_per_group_avg
 ):
     return (
-        torch.empty((topk_ids.shape[0] * topk_ids.shape[1], x.shape[1]), dtype=torch.float8_e4m3fn),
         torch.empty(
-            (topk_ids.shape[0] * topk_ids.shape[1], intermediate_size), dtype=torch.bfloat16
+            (topk_ids.shape[0] * topk_ids.shape[1], x.shape[1]),
+            dtype=torch.float8_e4m3fn,
+        ),
+        torch.empty(
+            (topk_ids.shape[0] * topk_ids.shape[1], intermediate_size),
+            dtype=torch.bfloat16,
         ),
         torch.empty((topk_ids.shape[0] * topk_ids.shape[1]), dtype=torch.int32),
         torch.empty((num_expert), dtype=torch.int32),

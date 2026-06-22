@@ -67,7 +67,7 @@ setup(
     author_email="authors@hpc-ops",
     url="https://github.com/Tencent/hpc-ops",
     license="Copyright (C) 2026 Tencent.",
-    packages=["hpc"],
+    packages=["hpc", "hpc.cute_fuse_moe"],
     ext_modules=[CMakeExtension("hpc", version_macros)],
     cmdclass={"build_ext": CMakeBuild},
     package_data={"_C": ["*.so"]},

@@ -48,6 +48,12 @@ __all__ = []
 
 _export_functions(_discover_modules())
 
+# Import CuTe DSL MoE subpackage (not auto-discovered since it's a directory)
+try:
+    from . import cute_fuse_moe  # noqa: F401
+except ImportError:
+    pass  # CuTe DSL not available (e.g., no cutlass Python package)
+
 __version__ = torch.ops.hpc.version()
 __built_json__ = torch.ops.hpc.built_json()
 
