@@ -17,11 +17,13 @@ namespace fuse_moe {
 
 namespace kernels {
 
-template <bool kUsePDL = false>
+// kIsPDLHead=true: chain-head producer — only trigger completion, never sync on upstream.
+// kIsPDLHead=false (normal kUsePDL): sync on upstream then trigger completion.
+template <bool kUsePDL = false, bool kIsPDLHead = false>
 __global__ void count_seq_kernel(const int *topk_ids_ptr, int *topk_pos_ptr, int *seqlens_ptr,
                                  int total_num_topk, int start_expert, int end_expert) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
-  if constexpr (kUsePDL) {
+  if constexpr (kUsePDL && !kIsPDLHead) {
     cudaGridDependencySynchronize();
   }
   if ((idx < total_num_topk)) {
@@ -36,7 +38,8 @@ __global__ void count_seq_kernel(const int *topk_ids_ptr, int *topk_pos_ptr, int
   }
 }
 
-template <int kThreadPerBlock, int kGroupPerThread, int kTileM, bool kUsePDL = false>
+template <int kThreadPerBlock, int kGroupPerThread, int kTileM, bool kUsePDL = false,
+          bool kIsPDLHead = false>
 __global__ void count_cuseq_kernel(const int *topk_ids_ptr, int *topk_pos_ptr, int *seqlens_ptr,
                                    int *cu_seqlens_ptr, int *tiles_ptr, int *cu_tiles_ptr,
                                    int num_seq, int num_topk, int total_num_topk, int num_expert,
@@ -46,7 +49,7 @@ __global__ void count_cuseq_kernel(const int *topk_ids_ptr, int *topk_pos_ptr, i
   // cusum
   int thread_seqs[kGroupPerThread];
   int thread_tiles[kGroupPerThread];
-  if constexpr (kUsePDL) {
+  if constexpr (kUsePDL && !kIsPDLHead) {
     cudaGridDependencySynchronize();
   }
 #pragma unroll
@@ -93,7 +96,8 @@ __global__ void count_cuseq_kernel(const int *topk_ids_ptr, int *topk_pos_ptr, i
   }
 }
 
-template <int kThreadPerBlock, int kGroupPerThread, int kTileM, bool kUsePDL = false>
+template <int kThreadPerBlock, int kGroupPerThread, int kTileM, bool kUsePDL = false,
+          bool kIsPDLHead = false>
 __global__ void count_seq_and_cuseq_kernel(const int *topk_ids_ptr, int *topk_pos_ptr,
                                            int *seqlens_ptr, int *cu_seqlens_ptr, int *tiles_ptr,
                                            int *cu_tiles_ptr, int num_seq, int num_topk,
@@ -108,7 +112,7 @@ __global__ void count_seq_and_cuseq_kernel(const int *topk_ids_ptr, int *topk_po
   }
   __syncthreads();
 
-  if constexpr (kUsePDL) {
+  if constexpr (kUsePDL && !kIsPDLHead) {
     cudaGridDependencySynchronize();
   }
 
@@ -171,7 +175,7 @@ __global__ void count_seq_and_cuseq_kernel(const int *topk_ids_ptr, int *topk_po
 
 template <typename T1, typename T2, typename GateUpTmaX, typename GateUpTmaY, typename DownTmaX,
           typename DownTmaY, int kWarpPerBlock, int kTileM, int kTileN, bool kAssignTask,
-          bool kUsePDL = false>
+          bool kUsePDL = false, bool kIsPDLHead = false>
 __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 4> td_xy,
                               cute::TmaDescriptor *gate_up_tma_xy, cute::TmaDescriptor *down_tma_xy,
                               T1 *gate_up_input_ptr, T2 *gate_up_output_ptr, T1 *down_input_ptr,
@@ -188,7 +192,7 @@ __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 4> td_xy,
   int ilane = idx % kThreadPerWarp;
   int itopk = iblock * kWarpPerBlock + iwarp;
 
-  if constexpr (kUsePDL) {
+  if constexpr (kUsePDL && !kIsPDLHead) {
     cudaGridDependencySynchronize();
   }
 
@@ -352,8 +356,9 @@ __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 4> td_xy,
 
 }  // namespace kernels
 
-template <int kTileM, int kTileN, int kTileK, int kStage, bool kUsePDL = false,
-          int kDownTileK = kTileK, bool kUseW4Mma = false>
+template <typename Tin, typename Tout, int kTileM, int kTileN, int kTileK, int kStage,
+          bool kUsePDL = false, int kDownTileK = kTileK, bool kUseW4Mma = false,
+          bool kIsPDLHead = false>
 void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
                              void *down_input_ptr, void *down_output_ptr, const void *x_ptr,
                              const void *topk_ids_ptr, void *topk_pos_ptr, void *seqlens_ptr,
@@ -363,9 +368,6 @@ void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
                              int intermediate_size, int num_topk, int num_expert, int eprank,
                              int num_seq_per_group_avg, cudaStream_t stream) {
   using namespace cute;  // NOLINT
-
-  using Tin = cute::float_e4m3_t;
-  using Tout = cute::bfloat16_t;
 
   int m = num_seq;
   int n = intermediate_size;
@@ -431,7 +433,8 @@ void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
       config.attrs = attribute;
       config.numAttrs = 1;
       auto kernel =
-          kernels::count_seq_and_cuseq_kernel<kThreadPerBlock, kGroupPerThread, kTileM, kUsePDL>;
+          kernels::count_seq_and_cuseq_kernel<kThreadPerBlock, kGroupPerThread, kTileM, kUsePDL,
+                                              kIsPDLHead>;
       cudaLaunchKernelEx(&config, kernel, (const int *)topk_ids_ptr, (int *)topk_pos_ptr,
                          (int *)seqlens_ptr, (int *)cu_seqlens_ptr, (int *)tiles_ptr,
                          (int *)cu_tiles_ptr, num_seq, num_topk, total_num_topk, num_expert,
@@ -454,7 +457,7 @@ void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
 
         config.attrs = attribute;
         config.numAttrs = 1;
-        auto kernel = kernels::count_seq_kernel<kUsePDL>;
+        auto kernel = kernels::count_seq_kernel<kUsePDL, kIsPDLHead>;
         cudaLaunchKernelEx(&config, kernel, (const int *)topk_ids_ptr, (int *)topk_pos_ptr,
                            (int *)seqlens_ptr, total_num_topk, start_expert, end_expert);
       }
@@ -476,7 +479,8 @@ void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
         config.attrs = attribute;
         config.numAttrs = 1;
         auto kernel =
-            kernels::count_cuseq_kernel<kThreadPerBlock, kGroupPerThread, kTileM, kUsePDL>;
+            kernels::count_cuseq_kernel<kThreadPerBlock, kGroupPerThread, kTileM, kUsePDL,
+                                        kIsPDLHead>;
         cudaLaunchKernelEx(&config, kernel, (const int *)topk_ids_ptr, (int *)topk_pos_ptr,
                            (int *)seqlens_ptr, (int *)cu_seqlens_ptr, (int *)tiles_ptr,
                            (int *)cu_tiles_ptr, num_seq, num_topk, total_num_topk, num_expert,
@@ -524,7 +528,7 @@ void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
       auto kernel =
           kernels::gather_kernel<Tin, Tout, decltype(gata_up_tma_x), decltype(gata_up_tma_y),
                                  decltype(down_tma_x), decltype(down_tma_y), kWarpPerBlock, kTileM,
-                                 kTaskTileN, kAssignTask, kUsePDL>;
+                                 kTaskTileN, kAssignTask, kUsePDL, kIsPDLHead>;
       cudaLaunchKernelEx(
           &config, kernel, td_xy, gate_up_tma_xy, down_tma_xy, (Tin *)gate_up_input_ptr,
           (Tout *)gate_up_output_ptr, (Tin *)down_input_ptr, (Tout *)down_output_ptr,
@@ -537,7 +541,7 @@ void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
       auto kernel =
           kernels::gather_kernel<Tin, Tout, decltype(gata_up_tma_x), decltype(gata_up_tma_y),
                                  decltype(down_tma_x), decltype(down_tma_y), kWarpPerBlock, kTileM,
-                                 kTaskTileN, kAssignTask, kUsePDL>;
+                                 kTaskTileN, kAssignTask, kUsePDL, kIsPDLHead>;
       cudaLaunchKernelEx(
           &config, kernel, td_xy, gate_up_tma_xy, down_tma_xy, (Tin *)gate_up_input_ptr,
           (Tout *)gate_up_output_ptr, (Tin *)down_input_ptr, (Tout *)down_output_ptr,
@@ -559,13 +563,15 @@ void count_and_gather_async(void *gate_up_input_ptr, void *gate_up_output_ptr, v
                             cudaStream_t stream) {
   constexpr int kTileN = 128;
   constexpr int kTileK = 128;
+  using Tin = cute::float_e4m3_t;
+  using Tout = cute::bfloat16_t;
 
   constexpr bool kUsePDL = true;
 
   if (num_seq_per_group_avg <= 8) {
     constexpr int kTileM = 8;
     constexpr int kStage = 8;
-    launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL>(
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
         cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
@@ -573,7 +579,7 @@ void count_and_gather_async(void *gate_up_input_ptr, void *gate_up_output_ptr, v
   } else if (num_seq_per_group_avg <= 16) {
     constexpr int kTileM = 16;
     constexpr int kStage = 8;
-    launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL>(
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
         cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
@@ -581,7 +587,7 @@ void count_and_gather_async(void *gate_up_input_ptr, void *gate_up_output_ptr, v
   } else if (num_seq_per_group_avg <= 32) {
     constexpr int kTileM = 32;
     constexpr int kStage = 8;
-    launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL>(
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
         cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
@@ -589,7 +595,7 @@ void count_and_gather_async(void *gate_up_input_ptr, void *gate_up_output_ptr, v
   } else if (num_seq_per_group_avg <= 48) {
     constexpr int kTileM = 48;
     constexpr int kStage = 8;
-    launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL>(
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
         cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
@@ -599,13 +605,13 @@ void count_and_gather_async(void *gate_up_input_ptr, void *gate_up_output_ptr, v
     constexpr int kStage = 8;
     if (intermediate_size / 2 <= 192) {
       constexpr int kDownTileK = 64;
-      launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL, kDownTileK>(
+      launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL, kDownTileK>(
           gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr,
           topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr,
           tiles_ptr, cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
           intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
     } else {
-      launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL>(
+      launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL>(
           gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr,
           topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr,
           tiles_ptr, cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
@@ -614,7 +620,7 @@ void count_and_gather_async(void *gate_up_input_ptr, void *gate_up_output_ptr, v
   } else if (num_seq_per_group_avg <= 96) {
     constexpr int kTileM = 48;
     constexpr int kStage = 8;
-    launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL>(
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
         cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
@@ -622,7 +628,7 @@ void count_and_gather_async(void *gate_up_input_ptr, void *gate_up_output_ptr, v
   } else if (num_seq_per_group_avg <= 128) {
     constexpr int kTileM = 32;
     constexpr int kStage = 8;
-    launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL>(
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
         cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
@@ -630,7 +636,7 @@ void count_and_gather_async(void *gate_up_input_ptr, void *gate_up_output_ptr, v
   } else if (num_seq_per_group_avg <= 144) {
     constexpr int kTileM = 48;
     constexpr int kStage = 8;
-    launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL>(
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
         cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
@@ -638,7 +644,102 @@ void count_and_gather_async(void *gate_up_input_ptr, void *gate_up_output_ptr, v
   } else {
     constexpr int kTileM = 64;
     constexpr int kStage = 8;
-    launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL>(
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL>(
+        gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
+        topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
+  }
+}
+
+void count_and_gather_bf16_async(void *gate_up_input_ptr, void *gate_up_output_ptr,
+                                 void *down_input_ptr, void *down_output_ptr, const void *x_ptr,
+                                 const void *topk_ids_ptr, void *topk_pos_ptr, void *seqlens_ptr,
+                                 void *cu_seqlens_ptr, void *gate_up_tmas_ptr, void *down_tmas_ptr,
+                                 void *tiles_ptr, void *cu_tiles_ptr, void *gateup_task_map_ptr,
+                                 void *down_task_map_ptr, int num_seq, int hidden_size,
+                                 int intermediate_size, int num_topk, int num_expert, int eprank,
+                                 int num_seq_per_group_avg, cudaStream_t stream) {
+  constexpr int kTileN = 128;
+  constexpr int kTileK = 64;
+  // bf16 gather is the chain head: kUsePDL=true to trigger completion toward the
+  // downstream GEMM, kIsPDLHead=true to skip cudaGridDependencySynchronize() since
+  // there is no upstream PDL predecessor.
+  constexpr bool kUsePDL = true;
+  constexpr bool kIsPDLHead = true;
+  using Tin = cute::bfloat16_t;
+  using Tout = cute::bfloat16_t;
+  // NOTE: bf16 GEMM uses SM90_U16x8_STSM_T copy atom which requires TileM >= 16.
+  // Therefore the kTileM=8 branch is intentionally absent here (unlike FP8 blockwise
+  // which uses a different copy atom). avg<=8 falls through to the kTileM=16 branch.
+  if (num_seq_per_group_avg <= 16) {
+    constexpr int kTileM = 16;
+    constexpr int kStage = 8;
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL, 128, false,
+                            kIsPDLHead>(
+        gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
+        topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
+  } else if (num_seq_per_group_avg <= 32) {
+    constexpr int kTileM = 32;
+    constexpr int kStage = 8;
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL, 128, false,
+                            kIsPDLHead>(
+        gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
+        topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
+  } else if (num_seq_per_group_avg <= 48) {
+    constexpr int kTileM = 48;
+    constexpr int kStage = 8;
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL, 128, false,
+                            kIsPDLHead>(
+        gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
+        topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
+  } else if (num_seq_per_group_avg <= 64) {
+    constexpr int kTileM = 64;
+    constexpr int kStage = 8;
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL, 128, false,
+                            kIsPDLHead>(
+        gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
+        topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
+  } else if (num_seq_per_group_avg <= 96) {
+    constexpr int kTileM = 48;
+    constexpr int kStage = 8;
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL, 128, false,
+                            kIsPDLHead>(
+        gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
+        topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
+  } else if (num_seq_per_group_avg <= 128) {
+    constexpr int kTileM = 32;
+    constexpr int kStage = 8;
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL, 128, false,
+                            kIsPDLHead>(
+        gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
+        topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
+  } else if (num_seq_per_group_avg <= 144) {
+    constexpr int kTileM = 48;
+    constexpr int kStage = 8;
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL, 128, false,
+                            kIsPDLHead>(
+        gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
+        topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
+  } else {
+    constexpr int kTileM = 64;
+    constexpr int kStage = 8;
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL, 128, false,
+                            kIsPDLHead>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
         cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,

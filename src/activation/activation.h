@@ -43,6 +43,10 @@ void masked_act_mul_and_blockwise_quant_async(__nv_fp8_e4m3 *output_ptr, float *
                                               int num_intermediate_size, int num_tokens_per_expert,
                                               cudaStream_t stream);
 
+void act_mul_bf16_async(__nv_bfloat16 *y_ptr, const __nv_bfloat16 *x_ptr,
+                        const int *valid_row_range, const int num_row, const int num_col,
+                        bool use_pdl, cudaStream_t stream);
+
 void scaled_fp8_quant_async(__nv_fp8_e4m3 *output_ptr, const __nv_bfloat16 *input_ptr,
                             const float *scale_ptr, int64_t numel, cudaStream_t stream);
 
