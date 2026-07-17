@@ -25,6 +25,15 @@ void group_gemm_fp8_route_async(void *y_ptr, const void *x_ptr, const void *w_pt
                                 int num_expert_local, int rank_ep, bool input_is_token,
                                 cudaStream_t stream);
 
+// Route-direct blockwise-scaled GEMM. Input and weight scales describe
+// 128-element K blocks; weight_scale_stride is the padded K-block dimension.
+void group_gemm_fp8_route_blockwise_async(
+    void *y_ptr, const void *x_ptr, const void *x_scale_ptr,
+    const void *w_ptr, const void *w_scale_ptr, const void *topk_ids_ptr,
+    int num_routes, int num_topk, int n, int k, int num_splits,
+    int num_expert_local, int rank_ep, bool input_is_token, int weight_scale_stride,
+    cudaStream_t stream);
+
 // Route-direct Gate/Up projection split along K. Output is BF16 with layout
 // [num_routes, num_splits, n], consumed by the activation kernel.
 void group_gemm_fp8_route_splitk_async(void *partial_ptr, const void *x_ptr,

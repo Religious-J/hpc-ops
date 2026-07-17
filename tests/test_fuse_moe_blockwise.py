@@ -354,17 +354,28 @@ def test_fuse_moe_blockwise_fp8(
     assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.01, atol=0.01)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 3, 8, 16])
-@pytest.mark.parametrize("intermediate_size", [192, 256])
+@pytest.mark.parametrize(
+    "num_tokens,hidden_size,intermediate_size",
+    [
+        (num_tokens, 256, intermediate_size)
+        for num_tokens in [1, 2, 3, 4, 8, 16]
+        for intermediate_size in [192, 256]
+    ]
+    + [
+        (1, 4096, 64),
+        (1, 2048, 768),
+        (2, 4096, 192),
+        (4, 4096, 512),
+    ],
+)
 @pytest.mark.parametrize("size_ep", [1, 2])
 @pytest.mark.parametrize("has_shared_output", [False, True])
 def test_fuse_moe_blockwise_fp8_warp_decode(
-    num_tokens, intermediate_size, size_ep, has_shared_output
+    num_tokens, hidden_size, intermediate_size, size_ep, has_shared_output
 ):
     dtype = torch.float8_e4m3fn
     num_expert = 16
     rank_ep = 0 if size_ep == 1 else 1
-    hidden_size = 256
     num_topk = 8
 
     topk_ids = torch.multinomial(
@@ -376,28 +387,34 @@ def test_fuse_moe_blockwise_fp8_warp_decode(
     topk_scale = torch.rand((num_tokens, num_topk), dtype=torch.float, device="cuda")
     topk_scale /= topk_scale.sum(dim=1, keepdim=True)
     x = (torch.randn((num_tokens, hidden_size), device="cuda") / 100).to(dtype)
-    x_scale = torch.randn((num_tokens, hidden_size // 128), device="cuda")
+
+    def make_scale(shape):
+        # Dequantization scales are positive in production checkpoints. Keep
+        # the original signed stress distribution for the legacy small shapes.
+        if hidden_size > 256:
+            return torch.rand(shape, device="cuda") * 0.02
+        return torch.randn(shape, device="cuda")
+
+    x_scale = make_scale((num_tokens, hidden_size // 128))
     gate_up_weight = torch.randn(
         (num_expert // size_ep, intermediate_size * 2, hidden_size), device="cuda"
     ).to(dtype)
-    gate_up_weight_scale = torch.randn(
+    gate_up_weight_scale = make_scale(
         (
             num_expert // size_ep,
             intermediate_size * 2 // 128,
             (hidden_size // 128 + 3) // 4 * 4,
-        ),
-        device="cuda",
+        )
     )
     down_weight = torch.randn(
         (num_expert // size_ep, hidden_size, intermediate_size), device="cuda"
     ).to(dtype)
-    down_weight_scale = torch.randn(
+    down_weight_scale = make_scale(
         (
             num_expert // size_ep,
             hidden_size // 128,
             ((intermediate_size + 127) // 128 + 3) // 4 * 4,
-        ),
-        device="cuda",
+        )
     )
     shared_output = (
         torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
@@ -405,19 +422,39 @@ def test_fuse_moe_blockwise_fp8_warp_decode(
         else None
     )
 
-    my = hpc.fuse_moe_blockwise_fp8(
-        x,
-        x_scale,
-        gate_up_weight,
-        gate_up_weight_scale,
-        down_weight,
-        down_weight_scale,
-        topk_ids,
-        topk_scale,
-        rank_ep,
-        num_expert,
-        shared_output,
-    )
+    if hidden_size > 256:
+        output = torch.empty(
+            (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+        )
+        my = hpc.fuse_moe_blockwise(
+            x,
+            x_scale,
+            gate_up_weight,
+            gate_up_weight_scale,
+            down_weight,
+            down_weight_scale,
+            topk_ids,
+            topk_scale,
+            rank_ep,
+            num_expert,
+            shared_output,
+            output,
+        )
+        assert my.data_ptr() == output.data_ptr()
+    else:
+        my = hpc.fuse_moe_blockwise_fp8(
+            x,
+            x_scale,
+            gate_up_weight,
+            gate_up_weight_scale,
+            down_weight,
+            down_weight_scale,
+            topk_ids,
+            topk_scale,
+            rank_ep,
+            num_expert,
+            shared_output,
+        )
     gt = naive_fuse_moe_blockwise_fp8(
         x,
         x_scale,

@@ -580,18 +580,19 @@ torch::Tensor fuse_moe_blockwise_entry(
 
   TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
 
-  // Small decode batches do not have enough rows per expert to amortize routing,
-  // input gathering, task-map construction, and a separate top-k reduction.  The
-  // blockwise warp path directly follows each token/top-k route while preserving
-  // the 128x128 weight scales and dynamic 128-element activation scales.
+  // Small decode batches do not have enough rows per expert to amortize routing
+  // and task-map construction. The route-direct path applies each 128-element
+  // activation/weight scale while accumulating FP8 WGMMA results.
+  TORCH_CHECK(intermediate_size % 2 == 0,
+              "gate_up_weight output dimension must be even");
   const int actual_intermediate_size = intermediate_size / 2;
-  const int64_t warp_decode_work = static_cast<int64_t>(num_tokens) * hidden_size *
-                                   actual_intermediate_size;
-  const bool has_intermediate_tail = actual_intermediate_size % 128 != 0;
-  const bool profitable_decode_shape =
-      has_intermediate_tail ? num_tokens <= 2 : warp_decode_work <= 2359296;
-  const bool use_warp_decode =
-      profitable_decode_shape && num_tokens <= 8 && num_topk == 8 && hidden_size <= 4096 &&
+  TORCH_CHECK(actual_intermediate_size > 0,
+              "intermediate_size must be positive");
+  TORCH_CHECK(down_weight.size(1) == hidden_size &&
+                  down_weight.size(2) == actual_intermediate_size,
+              "down_weight shape must be [num_expert, hidden_size, intermediate_size]");
+  const bool use_warp_decode_mma =
+      num_tokens > 0 && num_tokens <= 4 && num_topk == 8 && hidden_size <= 4096 &&
       actual_intermediate_size <= 768 && hidden_size % 128 == 0 &&
       actual_intermediate_size % 64 == 0;
 
@@ -609,23 +610,44 @@ torch::Tensor fuse_moe_blockwise_entry(
   }
   void *y_ptr = y.mutable_data_ptr();
 
-  if (use_warp_decode) {
-    const int num_routes = num_tokens * num_topk;
-    torch::Tensor activated = torch::empty(
-        {num_routes, actual_intermediate_size}, options.dtype(torch::kFloat32));
-    torch::Tensor quantized = torch::empty(
-        {num_routes, actual_intermediate_size}, options.dtype(torch::kFloat8_e4m3fn));
-    torch::Tensor quantized_scale = torch::empty(
-        {num_routes, (actual_intermediate_size + 127) / 128},
-        options.dtype(torch::kFloat32));
-    fuse_moe_warp_decode_blockwise_async(
+  if (use_warp_decode_mma) {
+    const int64_t num_routes = static_cast<int64_t>(num_tokens) * num_topk;
+    int num_splits = 1;
+    if (hidden_size > 2048) {
+      const int num_k_tiles = hidden_size / 128;
+      const int gate_tasks_without_split =
+          static_cast<int>(num_routes) * (intermediate_size / 64);
+      const int target_gate_tasks = get_sm_count() * 4;
+      const int desired_splits =
+          (target_gate_tasks + gate_tasks_without_split - 1) /
+          gate_tasks_without_split;
+      for (int candidate : {1, 2, 4, 8}) {
+        if (candidate >= desired_splits && num_k_tiles % candidate == 0) {
+          num_splits = candidate;
+          break;
+        }
+        if (num_k_tiles % candidate == 0) {
+          num_splits = candidate;
+        }
+      }
+    }
+    const int64_t num_intermediate_blocks =
+        (actual_intermediate_size + 127) / 128;
+    const int64_t workspace_bytes =
+        num_routes * num_splits * 2 * actual_intermediate_size *
+            sizeof(at::BFloat16) +
+        num_routes * actual_intermediate_size +
+        num_routes * num_intermediate_blocks * sizeof(float) +
+        num_routes * hidden_size * sizeof(at::BFloat16);
+    torch::Tensor workspace =
+        torch::empty({workspace_bytes}, options.dtype(torch::kUInt8));
+    fuse_moe_warp_decode_blockwise_mma_async(
         y_ptr, x.const_data_ptr(), x_scale.const_data_ptr(),
-        activated.mutable_data_ptr(), quantized.mutable_data_ptr(),
-        quantized_scale.mutable_data_ptr(), gate_up_weight.const_data_ptr(),
+        workspace.mutable_data_ptr(), gate_up_weight.const_data_ptr(),
         gate_up_weight_scale.const_data_ptr(), down_weight.const_data_ptr(),
         down_weight_scale.const_data_ptr(), topk_ids.const_data_ptr(),
         topk_scale.const_data_ptr(), shared_output_ptr, num_tokens, hidden_size,
-        actual_intermediate_size, num_topk, num_experts,
+        actual_intermediate_size, num_topk, num_splits, num_experts,
         gate_up_weight_scale_lastdim_pad4, down_weight_scale_lastdim_pad4, rank_ep,
         stream);
     return y;

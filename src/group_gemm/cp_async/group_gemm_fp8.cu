@@ -257,11 +257,13 @@ __device__ __forceinline__ void route_load_A_tile(
 // row 0 carries the route and rows 1..7 are zero-filled by cp.async. This is
 // deliberately route-major: the expert is read directly from topk_ids and no
 // sorting metadata is needed.
-template <typename Config, bool kInputIsToken>
+template <typename Config, bool kInputIsToken, bool kBlockwiseScale>
 __global__ void __launch_bounds__(128, 5) group_gemm_fp8_route_kernel(
     void *Cptr, const void *Aptr, const void *Bptr, const float *y_scale_ptr,
+    const float *input_scale_ptr, const float *weight_scale_ptr,
     const int *topk_ids_ptr, int num_routes, int num_topk, int n, int k,
     int num_expert_local, int start_expert, int num_splits, int tiles_per_split,
+    int input_scale_stride, int weight_scale_stride,
     cutlass::FastDivmod flat_divider, cutlass::FastDivmod split_divider,
     cutlass::FastDivmod topk_divider) {
   using namespace cute;  // NOLINT
@@ -374,7 +376,22 @@ __global__ void __launch_bounds__(128, 5) group_gemm_fp8_route_kernel(
 
     auto tDr = make_tensor_like(tCr);
     clear(tDr);
-    const float scale = y_scale_ptr[local_expert];
+    constexpr int kScaleBlock = 128;
+    const float *input_scale_row = nullptr;
+    const float *weight_scale_row = nullptr;
+    float tensor_scale = 0.0f;
+    if constexpr (kBlockwiseScale) {
+      const int n_block = itile_n * kTileN / kScaleBlock;
+      const int num_n_blocks = (n + kScaleBlock - 1) / kScaleBlock;
+      input_scale_row = input_scale_ptr +
+                        static_cast<uint64_t>(input_row) * input_scale_stride;
+      weight_scale_row = weight_scale_ptr +
+                         (static_cast<uint64_t>(local_expert) * num_n_blocks +
+                          n_block) *
+                             weight_scale_stride;
+    } else {
+      tensor_scale = y_scale_ptr[local_expert];
+    }
     for (int itile = 0; itile < ntile; ++itile) {
       if (itile_to_read < ntile) {
         route_load_A_tile<Config>(tsA_copy, static_cast<const Tin *>(Aptr), input_row,
@@ -385,6 +402,16 @@ __global__ void __launch_bounds__(128, 5) group_gemm_fp8_route_kernel(
         ismem_write = (ismem_write + 1) % kStage;
       }
       cp_async_fence();
+
+      float scale;
+      if constexpr (kBlockwiseScale) {
+        const int global_k_tile = first_k_tile + itile;
+        const int k_block = global_k_tile * kTileK / kScaleBlock;
+        scale = input_scale_row[k_block] * weight_scale_row[k_block];
+      } else {
+        scale = tensor_scale;
+      }
+
       cp_async_wait<kStage - 1>();
       __syncthreads();
 
@@ -587,7 +614,8 @@ void group_gemm_fp8_route_async(void *y_ptr, const void *x_ptr, const void *w_pt
     using GemmConfig = config::FP8GemmConfig<Tin, Tout, kTileM, kTileN, kTileK, kStage>;
     GemmConfig gemm_config;
     const int shm_size = gemm_config.kShmSize;
-    auto kernel = kernels::group_gemm_fp8_route_kernel<GemmConfig, kInputIsToken>;
+    auto kernel =
+        kernels::group_gemm_fp8_route_kernel<GemmConfig, kInputIsToken, false>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
     cudaLaunchAttribute attr[1];
@@ -602,10 +630,10 @@ void group_gemm_fp8_route_async(void *y_ptr, const void *x_ptr, const void *w_pt
     cfg.attrs = attr;
     cfg.numAttrs = 1;
     cudaLaunchKernelEx(&cfg, kernel, y_ptr, x_ptr, w_ptr,
-                       static_cast<const float *>(y_scale_ptr),
+                       static_cast<const float *>(y_scale_ptr), nullptr, nullptr,
                        static_cast<const int *>(topk_ids_ptr), num_routes, num_topk, n, k,
-                       num_expert_local, start_expert, 1, k / kTileK, flat_divider,
-                       split_divider, topk_divider);
+                       num_expert_local, start_expert, 1, k / kTileK, 0, 0,
+                       flat_divider, split_divider, topk_divider);
   };
 
   auto dispatch_input = [&](auto tile_k_tag, auto stage_tag) {
@@ -618,6 +646,90 @@ void group_gemm_fp8_route_async(void *y_ptr, const void *x_ptr, const void *w_pt
   if (k % 128 == 0) {
     dispatch_input(Int<128>{}, Int<2>{});
   } else {
+    dispatch_input(Int<64>{}, Int<3>{});
+  }
+}
+
+void group_gemm_fp8_route_blockwise_async(
+    void *y_ptr, const void *x_ptr, const void *x_scale_ptr,
+    const void *w_ptr, const void *w_scale_ptr, const void *topk_ids_ptr,
+    int num_routes, int num_topk, int n, int k, int num_splits,
+    int num_expert_local, int rank_ep, bool input_is_token, int weight_scale_stride,
+    cudaStream_t stream) {
+  using namespace cute;  // NOLINT
+  using Tin = cute::float_e4m3_t;
+  using Tout = cute::bfloat16_t;
+
+  assert(n % 64 == 0 &&
+         "group_gemm_fp8_route_blockwise_async: n must be a multiple of 64");
+  assert(k % 64 == 0 &&
+         "group_gemm_fp8_route_blockwise_async: k must be a multiple of 64");
+  assert(num_splits > 0 &&
+         "group_gemm_fp8_route_blockwise_async: num_splits must be positive");
+
+  constexpr int kTileM = 8;
+  constexpr int kTileN = 64;
+  constexpr int kScaleBlock = 128;
+  const int num_tile_n = n / kTileN;
+  const int num_tasks = num_routes * num_splits * num_tile_n;
+  if (num_tasks == 0) {
+    return;
+  }
+  cutlass::FastDivmod flat_divider(num_tile_n);
+  cutlass::FastDivmod split_divider(num_splits);
+  cutlass::FastDivmod topk_divider(num_topk);
+  const int start_expert = rank_ep * num_expert_local;
+  const int input_scale_stride = (k + kScaleBlock - 1) / kScaleBlock;
+
+  auto launch = [&](auto tile_k_tag, auto stage_tag,
+                    auto input_is_token_tag) {
+    constexpr int kTileK = decltype(tile_k_tag)::value;
+    constexpr int kStage = decltype(stage_tag)::value;
+    constexpr bool kInputIsToken = decltype(input_is_token_tag)::value;
+    assert((k / kTileK) % num_splits == 0 &&
+           "group_gemm_fp8_route_blockwise_async: split must divide K tiles");
+    const int tiles_per_split = (k / kTileK) / num_splits;
+    using GemmConfig =
+        config::FP8GemmConfig<Tin, Tout, kTileM, kTileN, kTileK, kStage>;
+    GemmConfig gemm_config;
+    const int shm_size = gemm_config.kShmSize;
+    auto kernel =
+        kernels::group_gemm_fp8_route_kernel<GemmConfig, kInputIsToken, true>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         shm_size);
+
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t cfg{};
+    const int max_grid = get_sm_count() * grid_multiplier(kTileM);
+    cfg.gridDim = dim3(num_tasks < max_grid ? num_tasks : max_grid);
+    cfg.blockDim = dim3(128);
+    cfg.dynamicSmemBytes = shm_size;
+    cfg.stream = stream;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    cudaLaunchKernelEx(
+        &cfg, kernel, y_ptr, x_ptr, w_ptr, nullptr,
+        static_cast<const float *>(x_scale_ptr),
+        static_cast<const float *>(w_scale_ptr),
+        static_cast<const int *>(topk_ids_ptr), num_routes, num_topk, n, k,
+        num_expert_local, start_expert, num_splits, tiles_per_split, input_scale_stride,
+        weight_scale_stride, flat_divider, split_divider, topk_divider);
+  };
+
+  auto dispatch_input = [&](auto tile_k_tag, auto stage_tag) {
+    if (input_is_token) {
+      launch(tile_k_tag, stage_tag, std::true_type{});
+    } else {
+      launch(tile_k_tag, stage_tag, std::false_type{});
+    }
+  };
+  if (k % 128 == 0 && (k / 128) % num_splits == 0) {
+    dispatch_input(Int<128>{}, Int<2>{});
+  } else {
+    assert((k / 64) % num_splits == 0 &&
+           "group_gemm_fp8_route_blockwise_async: split must divide K tiles");
     dispatch_input(Int<64>{}, Int<3>{});
   }
 }
@@ -658,7 +770,7 @@ void group_gemm_fp8_route_splitk_async(void *partial_ptr, const void *x_ptr,
     using GemmConfig = config::FP8GemmConfig<Tin, Tout, kTileM, kTileN, kTileK, kStage>;
     GemmConfig gemm_config;
     const int shm_size = gemm_config.kShmSize;
-    auto kernel = kernels::group_gemm_fp8_route_kernel<GemmConfig, true>;
+    auto kernel = kernels::group_gemm_fp8_route_kernel<GemmConfig, true, false>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
     const int max_grid = get_sm_count() * grid_multiplier(kTileM);
@@ -673,10 +785,10 @@ void group_gemm_fp8_route_splitk_async(void *partial_ptr, const void *x_ptr,
     cfg.attrs = attr;
     cfg.numAttrs = 1;
     cudaLaunchKernelEx(&cfg, kernel, partial_ptr, x_ptr, w_ptr,
-                       static_cast<const float *>(y_scale_ptr),
+                       static_cast<const float *>(y_scale_ptr), nullptr, nullptr,
                        static_cast<const int *>(topk_ids_ptr), num_routes, num_topk, n, k,
                        num_expert_local, start_expert, num_splits, tiles_per_split,
-                       flat_divider, split_divider, topk_divider);
+                       0, 0, flat_divider, split_divider, topk_divider);
   };
 
   if (k % 128 == 0 && (k / 128) % num_splits == 0) {
