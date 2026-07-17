@@ -308,24 +308,35 @@ __global__ void act_mul_and_blockwise_quant_fusemoe_kernel(
 
   int icol = it * 8;
 
-  if (icol < num_col) {
+  const bool valid = icol < num_col;
+  vec_t<float, 8> out;
+#pragma unroll
+  for (int i = 0; i < size(out); ++i) {
+    out[i] = 0.0f;
+  }
+
+  if (valid) {
     auto gate = to<float>(load<T, 4>(gate_row_ptr + icol));
     auto up = to<float>(load<T, 4>(up_row_ptr + icol));
 
-    vec_t<float, 8> out;
 #pragma unroll
     for (int i = 0; i < size(out); ++i) {
       out[i] = silu(gate[i]) * up[i];
     }
+  }
 
-    float thread_max = 0.f;
+  float thread_max = 0.f;
 #pragma unroll
-    for (int i = 0; i < size(out); i++) {
-      if (fabsf(out[i]) > thread_max) {
-        thread_max = fabsf(out[i]);
-      }
+  for (int i = 0; i < size(out); i++) {
+    if (fabsf(out[i]) > thread_max) {
+      thread_max = fabsf(out[i]);
     }
-    float max = half_warp_reduce_max_down(thread_max);
+  }
+  // Keep every lane in the 16-lane subgroup active so a final 64-element
+  // quantization block can safely participate in the shuffle reduction.
+  float max = half_warp_reduce_max_down(thread_max);
+
+  if (valid) {
     float scale = max / 448.0f;
     float inv_scale = 1.0f / (scale + 1e-8f);
 

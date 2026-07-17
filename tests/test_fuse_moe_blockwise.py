@@ -99,31 +99,29 @@ def naive_group_gemm(x, w, num_tokens_per_expert, cu_num_tokens_per_expert, xsca
 
         x_scale_group = xscale[start_idx:end_idx]  # (m, k / 128)
         w_scale_group = wscale[i]  # (n/128, 64)
-        w_scale_group = w_scale_group[:, : k // 128]
+        w_scale_group = w_scale_group[:, : (k + 127) // 128]
 
         assert x_group.size(1) == w_group.size(1)
         assert w_scale_group.size(0) == w_group.size(0) // 128
-        assert w_scale_group.size(1) == w_group.size(1) // 128
+        assert w_scale_group.size(1) == (w_group.size(1) + 127) // 128
 
         output = torch.zeros((m, n), dtype=torch.float32, device=x_group.device)
 
         num_tile_n = n // 128
-        num_tile_k = k // 128
-
-        x_chunks = torch.chunk(x_group, num_tile_k, dim=1)
-        w_chunks = torch.chunk(w_group, num_tile_k, dim=1)
+        num_tile_k = (k + 127) // 128
 
         for n in range(num_tile_n):
             tmp = torch.zeros((m, 128), dtype=torch.float32, device=x_group.device)
             for k in range(num_tile_k):
-                x_i = x_chunks[k]  # （m, 128)
+                start_k = k * 128
+                end_k = min(start_k + 128, x_group.size(1))
+                x_i = x_group[:, start_k:end_k]
                 x_scale_i = x_scale_group[:, k]  # (m, 1)
                 w_scale_i = w_scale_group[n, k]  # (1)
                 assert x_scale_i.size(0) == x_i.size(0)
                 assert w_scale_i.numel() == 1
 
-                w_chunk = w_chunks[k]  # (n, 128)
-                w_i = w_chunk[n * 128 : (n + 1) * 128].t()  # (128, 128)
+                w_i = w_group[n * 128 : (n + 1) * 128, start_k:end_k].t()
 
                 scale_a = torch.tensor([1.0], dtype=torch.float32, device="cuda")
                 scale_b = torch.tensor([1.0], dtype=torch.float32, device="cuda")
@@ -265,7 +263,7 @@ def naive_fuse_moe_blockwise_fp8(
 @pytest.mark.parametrize("num_tokens", [128, 1024, 2048, 4096])
 @pytest.mark.parametrize("num_topk", [8])
 @pytest.mark.parametrize("hidden_size", [512])
-@pytest.mark.parametrize("intermediate_size", [512, 256])
+@pytest.mark.parametrize("intermediate_size", [512, 256, 192])
 @pytest.mark.parametrize("num_expert", [128])
 @pytest.mark.parametrize("rank_ep", [0, 1])
 @pytest.mark.parametrize("size_ep", [1, 4, 8])
@@ -280,6 +278,8 @@ def test_fuse_moe_blockwise_fp8(
     size_ep,
     has_shared_output,
 ):
+    if intermediate_size == 192:
+        torch.manual_seed(0)
     dtype = torch.float8_e4m3fn
 
     topk_ids = torch.multinomial(
@@ -309,7 +309,11 @@ def test_fuse_moe_blockwise_fp8(
         device="cuda",
     ).to(dtype)
     down_weight_scale = torch.randn(
-        (num_expert // size_ep, hidden_size // 128, (intermediate_size // 128 + 3) // 4 * 4),
+        (
+            num_expert // size_ep,
+            hidden_size // 128,
+            (((intermediate_size + 127) // 128 + 3) // 4 * 4),
+        ),
         dtype=torch.float,
         device="cuda",
     )

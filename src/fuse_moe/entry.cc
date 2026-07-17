@@ -494,7 +494,8 @@ torch::Tensor fuse_moe_blockwise_entry(
               "gate_up_weight must be per 128 blockwise quant and must be aligned to 4");
   TORCH_CHECK(down_weight_scale.size(1) == down_weight.size(1) / 128,
               "down_weight must be per 128 blockwise quant");
-  TORCH_CHECK(down_weight_scale.size(2) == (down_weight.size(2) / 128 + 3) / 4 * 4,
+  TORCH_CHECK(down_weight_scale.size(2) ==
+                  (((down_weight.size(2) + 127) / 128 + 3) / 4 * 4),
               "down_weight must be per 128 blockwise quant and must be aligned to 4");
 
   const void *shared_output_ptr = nullptr;
@@ -567,8 +568,9 @@ torch::Tensor fuse_moe_blockwise_entry(
   torch::Tensor gate_up_tmas = torch::empty({num_experts * 2, 128}, options.dtype(torch::kInt8));
   torch::Tensor down_input = torch::empty({num_tokens * num_topk, intermediate_size / 2},
                                           options.dtype(torch::kFloat8_e4m3fn));
-  torch::Tensor down_input_scale = torch::empty({intermediate_size / 2 / 128, num_padded_tokens},
-                                                options.dtype(torch::kFloat32));
+  torch::Tensor down_input_scale = torch::empty(
+      {(intermediate_size / 2 + 127) / 128, num_padded_tokens},
+      options.dtype(torch::kFloat32));
   torch::Tensor down_output =
       torch::empty({num_tokens * num_topk, hidden_size}, options.dtype(torch::kBFloat16));
   torch::Tensor down_tmas = torch::empty({num_experts * 2, 128}, options.dtype(torch::kInt8));
