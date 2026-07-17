@@ -352,3 +352,83 @@ def test_fuse_moe_blockwise_fp8(
     torch.cuda.synchronize()
 
     assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.01, atol=0.01)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 8, 16])
+@pytest.mark.parametrize("intermediate_size", [192, 256])
+@pytest.mark.parametrize("size_ep", [1, 2])
+@pytest.mark.parametrize("has_shared_output", [False, True])
+def test_fuse_moe_blockwise_fp8_warp_decode(
+    num_tokens, intermediate_size, size_ep, has_shared_output
+):
+    dtype = torch.float8_e4m3fn
+    num_expert = 16
+    rank_ep = 0 if size_ep == 1 else 1
+    hidden_size = 256
+    num_topk = 8
+
+    topk_ids = torch.multinomial(
+        torch.ones((num_tokens, num_expert), dtype=torch.float, device="cuda"),
+        num_topk,
+        replacement=False,
+    ).to(torch.int32)
+    topk_ids, _ = torch.sort(topk_ids, dim=1)
+    topk_scale = torch.rand((num_tokens, num_topk), dtype=torch.float, device="cuda")
+    topk_scale /= topk_scale.sum(dim=1, keepdim=True)
+    x = (torch.randn((num_tokens, hidden_size), device="cuda") / 100).to(dtype)
+    x_scale = torch.randn((num_tokens, hidden_size // 128), device="cuda")
+    gate_up_weight = torch.randn(
+        (num_expert // size_ep, intermediate_size * 2, hidden_size), device="cuda"
+    ).to(dtype)
+    gate_up_weight_scale = torch.randn(
+        (
+            num_expert // size_ep,
+            intermediate_size * 2 // 128,
+            (hidden_size // 128 + 3) // 4 * 4,
+        ),
+        device="cuda",
+    )
+    down_weight = torch.randn(
+        (num_expert // size_ep, hidden_size, intermediate_size), device="cuda"
+    ).to(dtype)
+    down_weight_scale = torch.randn(
+        (
+            num_expert // size_ep,
+            hidden_size // 128,
+            ((intermediate_size + 127) // 128 + 3) // 4 * 4,
+        ),
+        device="cuda",
+    )
+    shared_output = (
+        torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
+        if has_shared_output
+        else None
+    )
+
+    my = hpc.fuse_moe_blockwise_fp8(
+        x,
+        x_scale,
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        topk_ids,
+        topk_scale,
+        rank_ep,
+        num_expert,
+        shared_output,
+    )
+    gt = naive_fuse_moe_blockwise_fp8(
+        x,
+        x_scale,
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        topk_ids,
+        topk_scale,
+        rank_ep,
+        num_expert,
+        shared_output,
+    )
+    assert allclose(gt.float(), my.float(), rtol=0.01, atol=0.01)
