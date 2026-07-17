@@ -10,7 +10,7 @@
 
 #include "src/fuse_moe/cp_async/fuse_moe_cp_async.h"
 #include "src/fuse_moe/fuse_moe.h"
-#include "src/fuse_moe/warp_decode.h"
+#include "src/fuse_moe/small_batch_route_mma.h"
 #include "src/utils/utils.h"
 
 namespace hpc {
@@ -360,11 +360,11 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
   TORCH_CHECK(down_weight.size(1) == hidden_size &&
                   down_weight.size(2) == actual_intermediate_size,
               "down_weight shape must be [num_expert, hidden_size, intermediate_size]");
-  const bool use_warp_decode_mma =
+  const bool use_small_batch_route_mma =
       num_seq > 0 && num_seq <= 4 && num_topk == 8 &&
       actual_intermediate_size > 0 && actual_intermediate_size <= 512 &&
       actual_intermediate_size % 64 == 0 && hidden_size % 64 == 0;
-  if (use_warp_decode_mma) {
+  if (use_small_batch_route_mma) {
     // Route-direct work stays close to the number of active experts for B<=4.
     // Split the long Gate/Up K dimension only when more CTAs are needed to
     // provide roughly four waves of work; all other shapes use the normal path.
@@ -395,7 +395,7 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
         num_routes * hidden_size * sizeof(at::BFloat16);
     torch::Tensor workspace =
         torch::empty({workspace_bytes}, options.dtype(torch::kUInt8));
-    fuse_moe_warp_decode_mma_async(
+    fuse_moe_small_batch_route_mma_async(
         y_ptr, x.const_data_ptr(), workspace.mutable_data_ptr(),
         gate_up_weight.const_data_ptr(), gate_up_scale.const_data_ptr(),
         act_and_mul_scale.const_data_ptr(), down_weight.const_data_ptr(),
@@ -591,7 +591,7 @@ torch::Tensor fuse_moe_blockwise_entry(
   TORCH_CHECK(down_weight.size(1) == hidden_size &&
                   down_weight.size(2) == actual_intermediate_size,
               "down_weight shape must be [num_expert, hidden_size, intermediate_size]");
-  const bool use_warp_decode_mma =
+  const bool use_small_batch_route_mma =
       num_tokens > 0 && num_tokens <= 4 && num_topk == 8 && hidden_size <= 4096 &&
       actual_intermediate_size <= 768 && hidden_size % 128 == 0 &&
       actual_intermediate_size % 64 == 0;
@@ -610,7 +610,7 @@ torch::Tensor fuse_moe_blockwise_entry(
   }
   void *y_ptr = y.mutable_data_ptr();
 
-  if (use_warp_decode_mma) {
+  if (use_small_batch_route_mma) {
     const int64_t num_routes = static_cast<int64_t>(num_tokens) * num_topk;
     int num_splits = 1;
     if (hidden_size > 2048) {
@@ -641,7 +641,7 @@ torch::Tensor fuse_moe_blockwise_entry(
         num_routes * hidden_size * sizeof(at::BFloat16);
     torch::Tensor workspace =
         torch::empty({workspace_bytes}, options.dtype(torch::kUInt8));
-    fuse_moe_warp_decode_blockwise_mma_async(
+    fuse_moe_blockwise_small_batch_route_mma_async(
         y_ptr, x.const_data_ptr(), x_scale.const_data_ptr(),
         workspace.mutable_data_ptr(), gate_up_weight.const_data_ptr(),
         gate_up_weight_scale.const_data_ptr(), down_weight.const_data_ptr(),

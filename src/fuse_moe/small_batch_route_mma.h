@@ -1,18 +1,18 @@
 // Copyright (C) 2026 Tencent.
 
-#ifndef SRC_FUSE_MOE_WARP_DECODE_H_
-#define SRC_FUSE_MOE_WARP_DECODE_H_
+#ifndef SRC_FUSE_MOE_SMALL_BATCH_ROUTE_MMA_H_
+#define SRC_FUSE_MOE_SMALL_BATCH_ROUTE_MMA_H_
 
 #include <cuda_runtime_api.h>
 
 namespace hpc {
 namespace fuse_moe {
 
-// SM90 route-direct implementation: Gate/Up WGMMA can split K for decode
+// SM90 route-direct implementation: Gate/Up WGMMA can split K for small-batch
 // occupancy, then one kernel reduces the partials, applies SwiGLU, and
 // requantizes for route-direct Down WGMMA. intermediate_ptr is a byte workspace
 // containing BF16 Gate/Up partials, FP8 Down input, and BF16 route output.
-void fuse_moe_warp_decode_mma_async(
+void fuse_moe_small_batch_route_mma_async(
     void *output_ptr, const void *input_ptr, void *intermediate_ptr,
     const void *gate_up_weight_ptr, const void *gate_up_scale_ptr,
     const void *act_and_mul_scale_ptr, const void *down_weight_ptr,
@@ -21,7 +21,7 @@ void fuse_moe_warp_decode_mma_async(
     int num_topk, int num_splits, int num_expert_local, int rank_ep, bool use_bf16_mul,
     cudaStream_t stream);
 
-void fuse_moe_warp_decode_blockwise_mma_async(
+void fuse_moe_blockwise_small_batch_route_mma_async(
     void *output_ptr, const void *input_ptr, const void *input_scale_ptr,
     void *workspace_ptr, const void *gate_up_weight_ptr,
     const void *gate_up_weight_scale_ptr, const void *down_weight_ptr,
@@ -34,4 +34,4 @@ void fuse_moe_warp_decode_blockwise_mma_async(
 }  // namespace fuse_moe
 }  // namespace hpc
 
-#endif  // SRC_FUSE_MOE_WARP_DECODE_H_
+#endif  // SRC_FUSE_MOE_SMALL_BATCH_ROUTE_MMA_H_

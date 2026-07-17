@@ -7,7 +7,7 @@
 #include <type_traits>
 
 #include "src/fuse_moe/fuse_moe.h"
-#include "src/fuse_moe/warp_decode.h"
+#include "src/fuse_moe/small_batch_route_mma.h"
 #include "src/group_gemm/cp_async/group_gemm.h"
 #include "src/utils/utils.cuh"
 
@@ -107,7 +107,7 @@ void split_partial_act_quant_async(
   }
 }
 
-void fuse_moe_warp_decode_mma_async(
+void fuse_moe_small_batch_route_mma_async(
     void *output_ptr, const void *input_ptr, void *intermediate_ptr,
     const void *gate_up_weight_ptr, const void *gate_up_scale_ptr,
     const void *act_and_mul_scale_ptr, const void *down_weight_ptr,
@@ -231,7 +231,7 @@ void blockwise_act_quant_async(
       intermediate_size);
 }
 
-void fuse_moe_warp_decode_blockwise_mma_async(
+void fuse_moe_blockwise_small_batch_route_mma_async(
     void *output_ptr, const void *input_ptr, const void *input_scale_ptr,
     void *workspace_ptr, const void *gate_up_weight_ptr,
     const void *gate_up_weight_scale_ptr, const void *down_weight_ptr,

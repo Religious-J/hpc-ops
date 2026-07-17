@@ -370,7 +370,7 @@ def test_fuse_moe_blockwise_fp8(
 )
 @pytest.mark.parametrize("size_ep", [1, 2])
 @pytest.mark.parametrize("has_shared_output", [False, True])
-def test_fuse_moe_blockwise_fp8_warp_decode(
+def test_fuse_moe_blockwise_fp8_small_batch_route_mma(
     num_tokens, hidden_size, intermediate_size, size_ep, has_shared_output
 ):
     dtype = torch.float8_e4m3fn
