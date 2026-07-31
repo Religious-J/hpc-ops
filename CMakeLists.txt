@@ -34,11 +34,11 @@ set_target_properties(
   VISIBILITY_INLINES_HIDDEN ON
   CUDA_VISIBILITY_PRESET "hidden"
 
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
   CXX_EXTENSIONS OFF
 
-  CUDA_STANDARD 17
+  CUDA_STANDARD 20
   CUDA_STANDARD_REQUIRED ON
   CUDA_EXTENSIONS OFF
 
@@ -100,7 +100,7 @@ target_compile_options(
     -Werror=all-warnings
     -lineinfo
     --expt-relaxed-constexpr
-    -std=c++17
+    -std=c++20
     -DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
     -DNDEBUG
     -Xptxas=-warn-double-usage,-v
